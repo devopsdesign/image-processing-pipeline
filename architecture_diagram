@@ -1,0 +1,34 @@
+// Image Processing Pipeline
+digraph {
+	bgcolor=white fontname=Helvetica rankdir=LR size="12,8"
+	User [label="User
+(Uploader)" color="#01579B" fillcolor="#E1F5FE" fontcolor="#000000" fontname=Helvetica fontsize=12 shape=ellipse style=filled]
+	S3In [label="S3 Input Bucket
+(uploads/)" color="#E65100" fillcolor="#FF9800" fontcolor=white fontname=Helvetica fontsize=12 shape=box style=filled]
+	Lambda [label="Lambda Function
+(Python 3.11)" color="#E65100" fillcolor="#FF9800" fontcolor=white fontname=Helvetica fontsize=12 shape=box style=filled]
+	Rekog [label="AWS Rekognition
+(AI Analysis)" color="#E65100" fillcolor="#FF9800" fontcolor=white fontname=Helvetica fontsize=12 shape=box style=filled]
+	Dyno [label="DynamoDB
+(Results)" color="#E65100" fillcolor="#FF9800" fontcolor=white fontname=Helvetica fontsize=12 shape=box style=filled]
+	S3Out [label="S3 Output Bucket
+(results/)" color="#E65100" fillcolor="#FF9800" fontcolor=white fontname=Helvetica fontsize=12 shape=box style=filled]
+	SNS [label="SNS Topic
+(Email Alert)" color="#2E7D32" fillcolor="#E8F5E9" fontcolor="#000000" fontname=Helvetica fontsize=12 shape=box style=filled]
+	User -> S3In [label="1. Upload Image" fontcolor=black]
+	S3In -> Lambda [label="2. Trigger Event" fontcolor=black]
+	Lambda -> Rekog [label="3. Analyze (Labels/Text/Faces)" fontcolor=black]
+	Lambda -> Dyno [label="4. Store Metadata" fontcolor=black]
+	Lambda -> S3Out [label="5. Save JSON" fontcolor=black]
+	Lambda -> SNS [label="6. Publish Notification" fontcolor=black]
+	SNS -> User [label="7. Receive Email" fontcolor=black style=dashed]
+	subgraph cluster_aws {
+		color=gray label="AWS Cloud Environment (Provisioned via Terraform)" style=dashed
+		S3In
+		Lambda
+		Rekog
+		Dyno
+		S3Out
+		SNS
+	}
+}

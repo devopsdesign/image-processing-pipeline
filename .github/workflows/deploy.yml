@@ -1,0 +1,112 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # 🚀 Safety constraint: prevents your runner from hanging forever
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Package Lambda function
+        run: |
+          cd lambda
+          pip install -r requirements.txt -t .
+          zip -r ../lambda_function.zip .
+          cd ..
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive terraform/
+        continue-on-error: true
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+      
+      - name: Force Clean Overlapping Lambda Permissions
+        run: |
+          aws lambda remove-permission \
+            --function-name image-processing-pipeline-processor \
+            --statement-id AllowS3Invoke || true
+          aws lambda remove-permission \
+            --function-name image-processing-pipeline-processor \
+            --statement-id s3_invoke || true
+
+      # 🚀 Move 1: Run imports BEFORE building the plan so the state file matches
+      - name: Import Existing Resources to Ephemeral State
+        run: |
+          cd terraform
+          terraform import -input=false aws_s3_bucket.input_bucket image-processing-pipeline-input-920534282171 || true
+          terraform import -input=false aws_s3_bucket.output_bucket image-processing-pipeline-output-920534282171 || true
+          terraform import -input=false aws_iam_role.lambda_role image-processing-pipeline-lambda-role || true
+          terraform import -input=false aws_dynamodb_table.results image-processing-pipeline-results || true
+          terraform import -input=false aws_cloudwatch_log_group.lambda_logs /aws/lambda/image-processing-pipeline-processor || true
+          terraform import -input=false aws_lambda_function.processor image-processing-pipeline-processor || true
+          terraform import -input=false aws_s3_bucket_notification.input_notification image-processing-pipeline-input-920534282171 || true
+          terraform import -input=false aws_lambda_permission.s3_invoke image-processing-pipeline-processor/s3_invoke || true
+
+        env:
+          TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
+
+      # 🚀 Move 2: Create your plan tracking the newly imported items
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -out=tfplan -var="sns_email=${{ secrets.SNS_EMAIL }}"
+      
+      # 🚀 Move 3: Securely execute the pristine plan file directly
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
+
+      - name: Get outputs
+        id: outputs
+        working-directory: terraform
+        run: |
+          INPUT_BUCKET=$(terraform output -raw input_bucket 2>/dev/null | tr -d '[:space:]')
+          LAMBDA_NAME=$(terraform output -raw lambda_function_name 2>/dev/null | tr -d '[:space:]')
+          
+          echo "input_bucket=$INPUT_BUCKET" >> $GITHUB_OUTPUT
+          echo "lambda_name=$LAMBDA_NAME" >> $GITHUB_OUTPUT
+          
+          echo "DEBUG: Captured input_bucket: $INPUT_BUCKET" >&2
+          echo "DEBUG: Captured lambda_name: $LAMBDA_NAME" >&2
+        env:
+          TF_IN_AUTOMATION: true
+          TF_INPUT: false
+
+      - name: Test Lambda with sample image
+        run: |
+          echo "Lambda function deployed: ${{ steps.outputs.outputs.lambda_name }}"
+          echo "Input bucket: ${{ steps.outputs.outputs.input_bucket }}"

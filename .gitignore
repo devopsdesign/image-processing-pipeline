@@ -1,0 +1,83 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+.tfplan
+*.tfplan
+
+# Terraform Variables (SENSITIVE)
+terraform.tfvars
+*.tfvars
+*.tfvars.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Lambda packaging
+lambda/index.zip
+lambda_function.zip
+lambda/*.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.pem
+.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+PIPFILE.lock
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Local development
+test_event.json
+*.local
+debug.log
+
+# Deployment
+deployment-info.txt
+deployment-outputs.txt
+.venv/
+__pycache__/
+*.pyc

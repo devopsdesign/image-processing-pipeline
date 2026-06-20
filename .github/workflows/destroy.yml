@@ -1,0 +1,63 @@
+name: Destroy Infrastructure
+
+on:
+  workflow_dispatch:
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Generates a valid zip file so filebase64sha256() does not crash during evaluation
+      - name: Generate Mock Lambda Zip for Validation
+        run: |
+          echo "// temporary placeholder for destroy" > index.js
+          zip lambda_function.zip index.js
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+
+      # Imports resources into ephemeral memory so Terraform tracks them before destroying
+      - name: Import Existing Resources to State Memory
+        run: |
+          cd terraform
+          terraform import -input=false aws_s3_bucket.input_bucket image-processing-pipeline-input-920534282171 || true
+          terraform import -input=false aws_s3_bucket.output_bucket image-processing-pipeline-output-920534282171 || true
+          terraform import -input=false aws_iam_role.lambda_role image-processing-pipeline-lambda-role || true
+          terraform import -input=false aws_dynamodb_table.results image-processing-pipeline-results || true
+          terraform import -input=false aws_cloudwatch_log_group.lambda_logs /aws/lambda/image-processing-pipeline-processor || true
+          terraform import -input=false aws_lambda_function.processor image-processing-pipeline-processor || true
+          terraform import -input=false aws_s3_bucket_notification.input_notification image-processing-pipeline-input-920534282171 || true
+        env:
+          TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
+
+      # 🚀 NEW STEP: Clear out all test images and JSON files to prevent BucketNotEmpty errors
+      - name: Force Purge S3 Objects
+        run: |
+          aws s3 rm s3://image-processing-pipeline-input-920534282171 --recursive || true
+          aws s3 rm s3://image-processing-pipeline-output-920534282171 --recursive || true
+
+      # Executes the absolute teardown of your architecture smoothly
+      - name: Terraform Destroy
+        run: |
+          cd terraform
+          terraform destroy -auto-approve -var="sns_email=${{ secrets.SNS_EMAIL }}"
