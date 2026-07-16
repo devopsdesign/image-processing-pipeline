@@ -9,10 +9,11 @@ rekognition_client = boto3.client('rekognition')
 dynamodb = boto3.resource('dynamodb')
 sns_client = boto3.client('sns')
 
-# 🚀 FIX: Fetch variables with safe fallbacks so empty compilation steps never crash
+# Keep the function lightweight and demo-friendly for low-volume AWS usage.
 OUTPUT_BUCKET = os.environ.get('OUTPUT_BUCKET', 'placeholder-bucket')
 DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE', 'placeholder-table')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:123456789012:placeholder')
+USE_REKOGNITION = os.environ.get('USE_REKOGNITION', 'false').lower() == 'true'
 
 table = dynamodb.Table(DYNAMODB_TABLE)
 
@@ -63,7 +64,9 @@ def handler(event, context):
 
 def analyze_image(bucket, key, image_id):
     """
-    Run Rekognition analysis: labels, text, faces
+    Run a lightweight analysis. Rekognition is optional and can be enabled
+    for richer AI insights while the default metadata mode keeps the demo
+    inexpensive and easy to explain.
     """
     results = {
         'image_id': image_id,
@@ -72,60 +75,69 @@ def analyze_image(bucket, key, image_id):
         'labels': [],
         'text': [],
         'faces': [],
-        'status': 'processed'
+        'status': 'processed',
+        'analysis_mode': 'metadata-only'
     }
 
     try:
-        # Detect labels (objects, scenes)
-        labels_response = rekognition_client.detect_labels(
-            Image={'S3Object': {'Bucket': bucket, 'Name': key}},
-            MaxLabels=10,
-            MinConfidence=70
-        )
-        results['labels'] = [
-            {
-                'name': label['Name'],
-                'confidence': label['Confidence']
-            }
-            for label in labels_response['Labels']
-        ]
+        if USE_REKOGNITION:
+            # Detect labels (objects, scenes)
+            labels_response = rekognition_client.detect_labels(
+                Image={'S3Object': {'Bucket': bucket, 'Name': key}},
+                MaxLabels=10,
+                MinConfidence=70
+            )
+            results['labels'] = [
+                {
+                    'name': label['Name'],
+                    'confidence': label['Confidence']
+                }
+                for label in labels_response['Labels']
+            ]
 
-        # Detect text
-        text_response = rekognition_client.detect_text(
-            Image={'S3Object': {'Bucket': bucket, 'Name': key}}
-        )
-        results['text'] = [
-            {
-                'value': item['DetectedText'],
-                'confidence': item['Confidence']
-            }
-            for item in text_response['TextDetections']
-            if item['Type'] == 'LINE'
-        ]
+            # Detect text
+            text_response = rekognition_client.detect_text(
+                Image={'S3Object': {'Bucket': bucket, 'Name': key}}
+            )
+            results['text'] = [
+                {
+                    'value': item['DetectedText'],
+                    'confidence': item['Confidence']
+                }
+                for item in text_response['TextDetections']
+                if item['Type'] == 'LINE'
+            ]
 
-        # Detect faces
-        faces_response = rekognition_client.detect_faces(
-            Image={'S3Object': {'Bucket': bucket, 'Name': key}},
-            Attributes=['ALL']
-        )
-        results['faces'] = [
-            {
-                'face_id': i,
-                'confidence': face['Confidence'],
-                'emotions': [
-                    {'type': e['Type'], 'confidence': e['Confidence']}
-                    for e in face.get('Emotions', [])
-                ]
-            }
-            for i, face in enumerate(faces_response['FaceDetails'])
-        ]
+            # Detect faces
+            faces_response = rekognition_client.detect_faces(
+                Image={'S3Object': {'Bucket': bucket, 'Name': key}},
+                Attributes=['ALL']
+            )
+            results['faces'] = [
+                {
+                    'face_id': i,
+                    'confidence': face['Confidence'],
+                    'emotions': [
+                        {'type': e['Type'], 'confidence': e['Confidence']}
+                        for e in face.get('Emotions', [])
+                    ]
+                }
+                for i, face in enumerate(faces_response['FaceDetails'])
+            ]
+            results['analysis_mode'] = 'rekognition'
 
-        print(f"Analysis complete: {len(results['labels'])} labels, "
-              f"{len(results['text'])} text items, {len(results['faces'])} faces")
+            print(f"Analysis complete: {len(results['labels'])} labels, "
+                  f"{len(results['text'])} text items, {len(results['faces'])} faces")
+        else:
+            results['labels'] = [{'name': 'image-uploaded', 'confidence': 100.0}]
+            results['text'] = []
+            results['faces'] = []
+            print('Using metadata-only analysis mode for a low-cost demo workflow')
 
     except Exception as e:
         print(f"Rekognition error: {str(e)}")
         results['status'] = 'partial_error'
+        results['analysis_mode'] = 'metadata-only-fallback'
 
     return results
 

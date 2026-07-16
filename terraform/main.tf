@@ -252,8 +252,8 @@ resource "aws_lambda_function" "processor" {
   handler          = "index.handler"
   source_code_hash = filebase64sha256("../lambda_function.zip")
   runtime          = "python3.11"
-  timeout          = 60
-  memory_size      = 512
+  timeout          = 15
+  memory_size      = 128
 
   environment {
     variables = {
@@ -292,10 +292,10 @@ resource "aws_lambda_permission" "s3_invoke" {
 # ============================================================================
 
 resource "aws_dynamodb_table" "results" {
-  name           = "${var.project_name}-results"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "image_id"
-  range_key      = "timestamp"
+  name         = "${var.project_name}-results"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "image_id"
+  range_key    = "timestamp"
 
   attribute {
     name = "image_id"

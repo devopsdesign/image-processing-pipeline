@@ -9,7 +9,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # 🚀 Safety constraint: prevents your runner from hanging forever
+    timeout-minutes: 15
     permissions:
       id-token: write
       contents: read
@@ -38,6 +38,7 @@ jobs:
       - name: Package Lambda function
         run: |
           cd lambda
+          python -m pip install --upgrade pip
           pip install -r requirements.txt -t .
           zip -r ../lambda_function.zip .
           cd ..
@@ -53,42 +54,14 @@ jobs:
       - name: Terraform Validate
         working-directory: terraform
         run: terraform validate
-      
-      - name: Force Clean Overlapping Lambda Permissions
-        run: |
-          aws lambda remove-permission \
-            --function-name image-processing-pipeline-processor \
-            --statement-id AllowS3Invoke || true
-          aws lambda remove-permission \
-            --function-name image-processing-pipeline-processor \
-            --statement-id s3_invoke || true
 
-      # 🚀 Move 1: Run imports BEFORE building the plan so the state file matches
-      - name: Import Existing Resources to Ephemeral State
-        run: |
-          cd terraform
-          terraform import -input=false aws_s3_bucket.input_bucket image-processing-pipeline-input-920534282171 || true
-          terraform import -input=false aws_s3_bucket.output_bucket image-processing-pipeline-output-920534282171 || true
-          terraform import -input=false aws_iam_role.lambda_role image-processing-pipeline-lambda-role || true
-          terraform import -input=false aws_dynamodb_table.results image-processing-pipeline-results || true
-          terraform import -input=false aws_cloudwatch_log_group.lambda_logs /aws/lambda/image-processing-pipeline-processor || true
-          terraform import -input=false aws_lambda_function.processor image-processing-pipeline-processor || true
-          terraform import -input=false aws_s3_bucket_notification.input_notification image-processing-pipeline-input-920534282171 || true
-          terraform import -input=false aws_lambda_permission.s3_invoke image-processing-pipeline-processor/s3_invoke || true
-
-        env:
-          TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
-
-      # 🚀 Move 2: Create your plan tracking the newly imported items
       - name: Terraform Plan
         working-directory: terraform
         run: terraform plan -out=tfplan -var="sns_email=${{ secrets.SNS_EMAIL }}"
-      
-      # 🚀 Move 3: Securely execute the pristine plan file directly
+
       - name: Terraform Apply
-        run: |
-          cd terraform
-          terraform apply -auto-approve tfplan
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
 
       - name: Get outputs
         id: outputs
@@ -96,17 +69,18 @@ jobs:
         run: |
           INPUT_BUCKET=$(terraform output -raw input_bucket 2>/dev/null | tr -d '[:space:]')
           LAMBDA_NAME=$(terraform output -raw lambda_function_name 2>/dev/null | tr -d '[:space:]')
-          
-          echo "input_bucket=$INPUT_BUCKET" >> $GITHUB_OUTPUT
-          echo "lambda_name=$LAMBDA_NAME" >> $GITHUB_OUTPUT
-          
+
+          echo "input_bucket=$INPUT_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "lambda_name=$LAMBDA_NAME" >> "$GITHUB_OUTPUT"
+
           echo "DEBUG: Captured input_bucket: $INPUT_BUCKET" >&2
           echo "DEBUG: Captured lambda_name: $LAMBDA_NAME" >&2
         env:
           TF_IN_AUTOMATION: true
           TF_INPUT: false
 
-      - name: Test Lambda with sample image
+      - name: Show deployment summary
         run: |
           echo "Lambda function deployed: ${{ steps.outputs.outputs.lambda_name }}"
           echo "Input bucket: ${{ steps.outputs.outputs.input_bucket }}"
+          echo "This deployment stays intentionally lightweight for a portfolio/demo setup."

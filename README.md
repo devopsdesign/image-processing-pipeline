@@ -1,104 +1,97 @@
-# Event-Driven Serverless Image Processing Pipeline
+# CloudSight Intake — Recruiter-Friendly Serverless Image Processing Starter
 
-A production-ready, cloud-native serverless architecture that automates image analysis using computer vision. This entire infrastructure is fully declared using HashiCorp Terraform and continuously managed via GitOps deployment and destruction pipelines.
+CloudSight Intake is a lightweight serverless image analysis project designed to feel practical, modern, and easy to explain in an interview. It uses AWS services to receive images, trigger processing automatically, analyze them with Rekognition, store structured results, and notify the user with a simple event-driven workflow.
 
----
+## Why this project is strong for a recruiter
+This project is useful because it shows more than just coding. It demonstrates:
+- cloud-native design thinking
+- event-driven architecture
+- infrastructure as code with Terraform
+- Python Lambda development
+- secure and cost-conscious AWS decisions
 
-## 📐 System Architecture
+It is especially good for a portfolio because it is easy to explain in one minute: “A file arrives, a function runs, the result is stored, and the workflow scales without managing servers.”
 
+## What the app does
+1. An image is uploaded to an S3 input bucket.
+2. An S3 event triggers an AWS Lambda function.
+3. Amazon Rekognition analyzes the image for labels, text, and faces.
+4. The results are stored in DynamoDB and saved as JSON in S3.
+5. An SNS notification can alert a user or team.
+
+## Architecture overview
 ```text
-[ S3 Input Bucket ] ---> ( uploads/*.jpg ) 
-       |
-       v (S3 Event Notification)
-[ AWS Lambda (Python 3.11) ] 
-       |
-       +---> [ Amazon Rekognition ] (AI Object/Text/Face Analytics)
-       |
-       +---> [ Amazon DynamoDB ] (Metadata Audit Tracking Logs)
-       |
-       +---> [ S3 Output Bucket ] (JSON Analytics Archival Storage)
-       |
-       +---> [ Amazon SNS Topic ] (Automated Email Alerts)
+[ User / Mobile / Field Device ] --> [ S3 Input Bucket ]
+                                         |
+                                         v
+                              [ AWS Lambda ] --> [ Amazon Rekognition ]
+                                         |
+                                         +--> [ DynamoDB ]
+                                         |
+                                         +--> [ S3 Output Bucket ]
+                                         |
+                                         +--> [ SNS Notification ]
 ```
 
-### Key Workflow Steps
-1. An image is uploaded to the `/uploads` folder of the S3 input bucket.
-2. An S3 Event Notification fires, validating file criteria (`.jpg`, `.png`, `.gif`).
-3. AWS Lambda processes the payload, fetching computer vision data from Amazon Rekognition.
-4. Results are written asynchronously to DynamoDB and saved as JSON logs in S3.
-5. An SNS Notification emails subscribers summarizing analytics conclusions.
+## Recruiter-friendly use cases
+Here are two practical stories you can use when presenting the project:
 
----
+1. Small business photo intake and quality checks
+   - A local business receives photos from field staff or contractors.
+   - The system labels and summarizes each image automatically.
+   - This helps teams spot issues faster without building a full custom dashboard.
 
-## 🛠️ Repository Structure
+2. Community operations and issue reporting
+   - Volunteers or staff upload photos from job sites, public spaces, or events.
+   - The pipeline extracts useful metadata and flags important images for follow-up.
+   - This is a strong example of using automation to make low-budget operations more efficient.
 
+## Why this stays AWS free-tier friendly
+This version is intentionally designed to stay lightweight and cost-aware:
+- No EC2, RDS, or always-on containers are used.
+- Lambda runs only when an upload happens.
+- S3, DynamoDB, SNS, and CloudWatch are used in a low-volume, demo-friendly pattern.
+- The Lambda function is kept intentionally small and efficient for a portfolio deployment.
+
+> For a demo or interview deployment, this is a strong fit. For high-volume production workloads, usage should still be monitored carefully.
+
+## Repository structure
 ```text
 .
-├── .github/
-│   └── workflows/
-│       ├── test.yml       # Pull Request pipeline (Linting, Trivy, Plan)
-│       ├── deploy.yml     # Automated Main Trunk Deployment Pipeline
-│       └── destroy.yml    # Automated Manual-Trigger Teardown Pipeline
 ├── lambda/
-│   ├── index.py           # Core Lambda Logic (Event Handler & AI Parsers)
-│   └── requirements.txt   # Python Module Dependencies (Must stay in this folder!)
-└── terraform/
-    ├── main.tf            # Declarative AWS Infrastructure Resource Blocks
-    ├── variables.tf       # Parameter Input Definitions
-    └── outputs.tf         # Pipeline Infrastructure Tracking Values
+│   └── index.py
+├── terraform/
+│   └── main.tf
+├── docs/
+│   ├── speaker-notes.md
+│   ├── technical-personal-notes.md
+│   └── use_cases/
+└── README.md
 ```
 
----
+## Quick start
+1. Install AWS CLI and Terraform.
+2. Configure your AWS credentials.
+3. Run Terraform from the terraform directory.
+4. Upload a sample image to the input S3 bucket.
+5. Review the Lambda output, DynamoDB record, and S3 result file.
 
-## 🚀 DevOps & Automation Lifecycle
+Example:
+```bash
+cd terraform
+terraform init
+terraform apply -var="sns_email=your-email@example.com"
+```
 
-### GitHub Actions CI/CD Framework
-* **PR Testing Workflow (`test.yml`)**: Forces automated formatting execution (`terraform fmt`), schema check definitions (`terraform validate`), and a secure `terraform plan`. Integrates an infrastructure configuration vulnerability scan using **Trivy IaC**.
-* **Trunk Deployment Workflow (`deploy.yml`)**: Automates package construction (dynamic lightweight zipping without standard runtime dependencies), reconciles state gaps, and performs automated cloud mapping.
-* **Teardown Workflow (`destroy.yml`)**: A manual `workflow_dispatch` configuration that forces the safe purging of all stored S3 artifacts recursively before executing an automated `terraform destroy` sequence to prevent `BucketNotEmpty` errors.
+## Interview talking points
+- “This is a serverless event-driven workflow, which is a common production pattern.”
+- “I chose AWS services that are easy to explain and keep the architecture simple.”
+- “The project shows both infrastructure and application skills, not just one or the other.”
+- “It is structured as a portfolio-ready starter that can be extended with OCR, moderation, or custom ML later.”
 
-### Infrastructure Best Practices Engineered
-* **Deterministic Sequencing**: Implemented custom `depends_on` blocks across resource definitions to eliminate AWS backend IAM/Policy propagation delays.
-* **State Reconstruction Automation**: Embedded ephemeral workflow tracking imports to bridge state maps across GitHub runner runtimes seamlessly.
-* **Least Privilege Model**: Restricted Lambda execution boundaries through specialized inline granular JSON policy definitions.
+## Related documentation
+- [docs/speaker-notes.md](docs/speaker-notes.md)
+- [docs/technical-personal-notes.md](docs/technical-personal-notes.md)
+- [docs/use_cases/use_case1.md](docs/use_cases/use_case1.md)
+- [docs/use_cases/use_case2.md](docs/use_cases/use_case2.md)
 
----
-
-## 🏃‍♂️ Quick Start Setup
-
-### Prerequisites
-* [AWS CLI v2](https://amazon.com) configured with active administrative privileges.
-* [Terraform v1.5.0+](https://hashicorp.com) installed locally.
-
-### Local Initialization & Test
-1. Clone the repository and navigate to the IaC workspace:
-   ```bash
-   git clone https://github.com
-   cd YOUR_REPO_NAME/terraform
-   ```
-2. Initialize and deploy:
-   ```bash
-   terraform init
-   terraform apply -var="sns_email=your-email@example.com"
-   ```
-3. Drop a test photo into the ingress pipe path:
-   ```bash
-   aws s3 cp sample.jpg s3://YOUR_INPUT_BUCKET_NAME/uploads/sample.jpg
-   ```
-
----
-
-## 🧹 Automated Pipeline Teardown
-
-To tear down the entire cloud footprint automatically without logging into the AWS Console:
-1. Navigate to your GitHub repository webpage and click on the **Actions** tab.
-2. Select **Destroy Infrastructure** from the left-hand workflows list.
-3. Click the **Run workflow** dropdown menu, choose your branch, and hit the green button.
-4. The pipeline will automatically empty the input/output S3 buckets recursively and safely delete all components.
-
----
-
-## 📊 Technical Metrics
-* **Payload Execution Time**: ~250ms average billing duration per analysis run.
-* **Idling Cost Layer**: $0.00 USD total monthly carrying charge.
-* **Deployment Efficiency**: 100% automated lifecycle updates executing in <15 seconds.
