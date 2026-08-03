@@ -29,7 +29,6 @@ if not all([OUTPUT_BUCKET, DYNAMODB_TABLE, SNS_TOPIC_ARN]):
 
 table = dynamodb.Table(DYNAMODB_TABLE)
 
-
 def handler(event, context):
     image_id = str(uuid.uuid4())
     start_time = datetime.now(timezone.utc)
@@ -52,7 +51,10 @@ def handler(event, context):
             logger.info(f"Image already processed: {key}")
             return create_response('skipped', 'Already processed', image_id)
         
+        # Analyze Image
         results = analyze_image(bucket, key, image_id)
+        
+        # Store results (Summary is generated here based on actual data)
         store_results(image_id, key, results)
         
         if results.get('status') == 'processed':
@@ -69,11 +71,9 @@ def handler(event, context):
         send_error_notification(key, str(e))
         return create_response('error', str(e), image_id)
 
-
 def is_valid_image(key):
     valid_extensions = ['.jpg', '.jpeg', '.png', '.gif']
     return any(key.lower().endswith(ext) for ext in valid_extensions)
-
 
 def is_already_processed(image_id, key):
     try:
@@ -82,7 +82,6 @@ def is_already_processed(image_id, key):
     except ClientError as e:
         logger.warning(f"DynamoDB check failed: {str(e)}")
         return False
-
 
 def analyze_image(bucket, key, image_id):
     results = {
@@ -102,7 +101,7 @@ def analyze_image(bucket, key, image_id):
         return results
     
     try:
-        # Detect labels
+        # 1. Detect Labels
         try:
             labels_response = rekognition_client.detect_labels(
                 Image={'S3Object': {'Bucket': bucket, 'Name': key}},
@@ -117,7 +116,7 @@ def analyze_image(bucket, key, image_id):
         except ClientError as e:
             logger.warning(f"Label detection failed: {str(e)}")
         
-        # Detect text
+        # 2. Detect Text (only if labels found to save calls)
         if results['labels']:
             try:
                 text_response = rekognition_client.detect_text(
@@ -132,14 +131,14 @@ def analyze_image(bucket, key, image_id):
             except ClientError as e:
                 logger.warning(f"Text detection failed: {str(e)}")
         
-        # Detect faces - FIXED: Slice the list BEFORE enumerating
+        # 3. Detect Faces (only if labels or text found)
         if results['labels'] or results['text']:
             try:
                 faces_response = rekognition_client.detect_faces(
                     Image={'S3Object': {'Bucket': bucket, 'Name': key}},
                     Attributes=['ALL']
                 )
-                # FIX: Slice the FaceDetails list first, then enumerate
+                # FIX: Slice the list BEFORE enumerating
                 faces_list = faces_response['FaceDetails'][:3]
                 results['faces'] = [
                     {
@@ -171,27 +170,41 @@ def analyze_image(bucket, key, image_id):
     
     return results
 
-
 def store_results(image_id, image_key, results):
+    # Generate summary based on ACTUAL data in results
+    label_count = len(results.get('labels', []))
+    face_count = len(results.get('faces', []))
+    text_count = len(results.get('text', []))
+    
+    # Create a readable summary string
+    summary_parts = []
+    if label_count > 0:
+        summary_parts.append(f"{label_count} labels")
+    if text_count > 0:
+        summary_parts.append(f"{text_count} text items")
+    if face_count > 0:
+        summary_parts.append(f"{face_count} faces")
+    
+    summary_str = ", ".join(summary_parts) if summary_parts else "No analysis data found"
+
     item = {
         'image_id': image_id,
         'timestamp': results['timestamp'],
         'image_key': image_key,
         'status': results['status'],
-        'label_count': len(results['labels']),
-        'face_count': len(results['faces']),
-        'text_count': len(results['text']),
+        'label_count': label_count,
+        'face_count': face_count,
+        'text_count': text_count,
         'rekognition_calls_used': results.get('rekognition_calls_used', 0),
         'analysis_mode': results.get('analysis_mode', 'unknown'),
-        'summary': f"{len(results['labels'])} labels, {len(results['text'])} text, {len(results['faces'])} faces"
+        'summary': summary_str  # This is the key field that was showing 'n/a'
     }
     
     try:
         table.put_item(Item=item)
-        logger.info(f"Stored results in DynamoDB for {image_id}")
+        logger.info(f"Stored results in DynamoDB for {image_id} - Summary: {summary_str}")
     except ClientError as e:
         logger.error(f"DynamoDB storage failed: {str(e)}")
-
 
 def save_results_to_s3(image_id, image_key, results):
     filename = f"results/{image_id}.json"
@@ -207,14 +220,14 @@ def save_results_to_s3(image_id, image_key, results):
     except ClientError as e:
         logger.error(f"S3 storage failed: {str(e)}")
 
-
 def send_notification(image_id, image_key, results):
+    summary = results.get('summary', 'No summary available')
     message = f"""
 Image Processing Complete
 
 📷 Image: {image_key}
 ✅ Status: {results['status']}
-📊 Analysis: {results.get('summary', 'N/A')}
+📊 Analysis: {summary}
 🔍 Mode: {results.get('analysis_mode', 'unknown')}
 📦 Results: s3://{OUTPUT_BUCKET}/results/{image_id}.json
     """
@@ -228,7 +241,6 @@ Image Processing Complete
     except ClientError as e:
         logger.error(f"Notification failed: {str(e)}")
 
-
 def send_error_notification(image_key, error):
     error_msg = error[:500] if len(error) > 500 else error
     sns_client.publish(
@@ -236,7 +248,6 @@ def send_error_notification(image_key, error):
         Subject=f"⚠️ Image Processing Failed: {image_key}",
         Message=f"Error processing {image_key}: {error_msg}"
     )
-
 
 def create_response(status, message, image_id, results=None):
     response = {
@@ -257,7 +268,8 @@ def create_response(status, message, image_id, results=None):
                 'label_count': len(results.get('labels', [])),
                 'text_count': len(results.get('text', [])),
                 'face_count': len(results.get('faces', [])),
-                'analysis_mode': results.get('analysis_mode', 'unknown')
+                'analysis_mode': results.get('analysis_mode', 'unknown'),
+                'summary': results.get('summary', 'N/A')
             }
         })
     
