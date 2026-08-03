@@ -226,16 +226,32 @@ def save_results_to_s3(image_id, image_key, results):
         logger.error(f"S3 storage failed: {str(e)}")
 
 def send_notification(image_id, image_key, results):
-    # Now this will definitely have the summary because we added it in the handler
+    """
+    Send SNS notification with detailed label info.
+    """
     summary = results.get('summary', 'No analysis data found')
+    
+    # Extract label names for the detailed list
+    label_names = [label['name'] for label in results.get('labels', [])]
+    label_details = ", ".join(label_names) if label_names else "None"
+    
+    # Extract text and faces counts
+    text_count = len(results.get('text', []))
+    face_count = len(results.get('faces', []))
+    
     message = f"""
 Image Processing Complete
 
 📷 Image: {image_key}
 ✅ Status: {results['status']}
-📊 Analysis: {summary}
-🔍 Mode: {results.get('analysis_mode', 'unknown')}
-📦 Results: s3://{OUTPUT_BUCKET}/results/{image_id}.json
+
+🔍 Detailed Analysis:
+   • Labels Detected ({len(label_names)}): {label_details}
+   • Text Items: {text_count}
+   • Faces Detected: {face_count}
+
+📊 Mode: {results.get('analysis_mode', 'unknown')}
+📦 Full JSON Results: s3://{OUTPUT_BUCKET}/results/{image_id}.json
     """
     try:
         sns_client.publish(
@@ -243,7 +259,7 @@ Image Processing Complete
             Subject=f"Image Processed: {image_key}",
             Message=message
         )
-        logger.info("Notification sent")
+        logger.info("Notification sent with detailed labels")
     except ClientError as e:
         logger.error(f"Notification failed: {str(e)}")
 
