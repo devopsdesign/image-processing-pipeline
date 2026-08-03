@@ -54,7 +54,25 @@ def handler(event, context):
         # Analyze Image
         results = analyze_image(bucket, key, image_id)
         
-        # Store results (Summary is generated here based on actual data)
+        # Generate Summary HERE (before storing and notifying)
+        label_count = len(results.get('labels', []))
+        face_count = len(results.get('faces', []))
+        text_count = len(results.get('text', []))
+        
+        summary_parts = []
+        if label_count > 0:
+            summary_parts.append(f"{label_count} labels")
+        if text_count > 0:
+            summary_parts.append(f"{text_count} text items")
+        if face_count > 0:
+            summary_parts.append(f"{face_count} faces")
+        
+        summary_str = ", ".join(summary_parts) if summary_parts else "No analysis data found"
+        
+        # Add summary to results object so it's available for notification
+        results['summary'] = summary_str
+
+        # Store results
         store_results(image_id, key, results)
         
         if results.get('status') == 'processed':
@@ -171,33 +189,20 @@ def analyze_image(bucket, key, image_id):
     return results
 
 def store_results(image_id, image_key, results):
-    # Generate summary based on ACTUAL data in results
-    label_count = len(results.get('labels', []))
-    face_count = len(results.get('faces', []))
-    text_count = len(results.get('text', []))
+    # Summary is now passed in from the handler, so we just use it
+    summary_str = results.get('summary', 'No analysis data found')
     
-    # Create a readable summary string
-    summary_parts = []
-    if label_count > 0:
-        summary_parts.append(f"{label_count} labels")
-    if text_count > 0:
-        summary_parts.append(f"{text_count} text items")
-    if face_count > 0:
-        summary_parts.append(f"{face_count} faces")
-    
-    summary_str = ", ".join(summary_parts) if summary_parts else "No analysis data found"
-
     item = {
         'image_id': image_id,
         'timestamp': results['timestamp'],
         'image_key': image_key,
         'status': results['status'],
-        'label_count': label_count,
-        'face_count': face_count,
-        'text_count': text_count,
+        'label_count': len(results.get('labels', [])),
+        'face_count': len(results.get('faces', [])),
+        'text_count': len(results.get('text', [])),
         'rekognition_calls_used': results.get('rekognition_calls_used', 0),
         'analysis_mode': results.get('analysis_mode', 'unknown'),
-        'summary': summary_str  # This is the key field that was showing 'n/a'
+        'summary': summary_str
     }
     
     try:
@@ -221,7 +226,8 @@ def save_results_to_s3(image_id, image_key, results):
         logger.error(f"S3 storage failed: {str(e)}")
 
 def send_notification(image_id, image_key, results):
-    summary = results.get('summary', 'No summary available')
+    # Now this will definitely have the summary because we added it in the handler
+    summary = results.get('summary', 'No analysis data found')
     message = f"""
 Image Processing Complete
 
