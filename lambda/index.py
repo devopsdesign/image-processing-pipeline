@@ -189,4 +189,76 @@ def store_results(image_id, image_key, results):
     try:
         table.put_item(Item=item)
         logger.info(f"Stored results in DynamoDB for {image_id}")
-    except
+    except ClientError as e:
+        logger.error(f"DynamoDB storage failed: {str(e)}")
+
+
+def save_results_to_s3(image_id, image_key, results):
+    filename = f"results/{image_id}.json"
+    try:
+        json_data = json.dumps(results, separators=(',', ':'))
+        s3_client.put_object(
+            Bucket=OUTPUT_BUCKET,
+            Key=filename,
+            Body=json_data,
+            ContentType='application/json'
+        )
+        logger.info(f"Saved results to s3://{OUTPUT_BUCKET}/{filename}")
+    except ClientError as e:
+        logger.error(f"S3 storage failed: {str(e)}")
+
+
+def send_notification(image_id, image_key, results):
+    message = f"""
+Image Processing Complete
+
+📷 Image: {image_key}
+✅ Status: {results['status']}
+📊 Analysis: {results.get('summary', 'N/A')}
+🔍 Mode: {results.get('analysis_mode', 'unknown')}
+📦 Results: s3://{OUTPUT_BUCKET}/results/{image_id}.json
+    """
+    try:
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=f"Image Processed: {image_key}",
+            Message=message
+        )
+        logger.info("Notification sent")
+    except ClientError as e:
+        logger.error(f"Notification failed: {str(e)}")
+
+
+def send_error_notification(image_key, error):
+    error_msg = error[:500] if len(error) > 500 else error
+    sns_client.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=f"⚠️ Image Processing Failed: {image_key}",
+        Message=f"Error processing {image_key}: {error_msg}"
+    )
+
+
+def create_response(status, message, image_id, results=None):
+    response = {
+        'statusCode': 200 if status == 'success' else 500,
+        'body': json.dumps({
+            'status': status,
+            'message': message,
+            'image_id': image_id
+        })
+    }
+    
+    if status == 'success' and results:
+        response['body'] = json.dumps({
+            'status': status,
+            'message': message,
+            'image_id': image_id,
+            'results': {
+                'label_count': len(results.get('labels', [])),
+                'text_count': len(results.get('text', [])),
+                'face_count': len(results.get('faces', [])),
+                'analysis_mode': results.get('analysis_mode', 'unknown')
+            }
+        })
+    
+    return response
