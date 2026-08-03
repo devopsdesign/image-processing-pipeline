@@ -81,6 +81,24 @@ resource "aws_s3_bucket_public_access_block" "output" {
   restrict_public_buckets = true
 }
 
+# S3 Lifecycle Rule to auto-purge uploads after 7 days (Free Tier Cost Protection)
+resource "aws_s3_bucket_lifecycle_configuration" "input_lifecycle" {
+  bucket = aws_s3_bucket.input_bucket.id
+
+  rule {
+    id     = "expire-demo-uploads"
+    status = "Enabled"
+
+    filter {
+      prefix = "uploads/"
+    }
+
+    expiration {
+      days = 7
+    }
+  }
+}
+
 # S3 Event Notification
 resource "aws_s3_bucket_notification" "input_notification" {
   bucket     = aws_s3_bucket.input_bucket.id
@@ -257,9 +275,10 @@ resource "aws_lambda_function" "processor" {
 
   environment {
     variables = {
-      OUTPUT_BUCKET  = aws_s3_bucket.output_bucket.id
-      DYNAMODB_TABLE = aws_dynamodb_table.results.name
-      SNS_TOPIC_ARN  = aws_sns_topic.notifications.arn
+      OUTPUT_BUCKET   = aws_s3_bucket.output_bucket.id
+      DYNAMODB_TABLE  = aws_dynamodb_table.results.name
+      SNS_TOPIC_ARN   = aws_sns_topic.notifications.arn
+      USE_REKOGNITION = "true" # Explicitly enabled for live interviewer AI telemetry demo
     }
   }
 
@@ -268,8 +287,6 @@ resource "aws_lambda_function" "processor" {
     Project = "PortfolioDemo"
   }
 
-  # 🚀 THIS BLOCK PREVENTS THE "STILL CREATING..." HANG
-  # It forces Terraform to wait for the IAM policies and Log Groups to be fully ready
   depends_on = [
     aws_iam_role.lambda_role,
     aws_iam_role_policy.lambda_sns_policy,
@@ -385,4 +402,3 @@ output "lambda_function_name" {
   description = "Lambda function name"
   value       = aws_lambda_function.processor.function_name
 }
-
