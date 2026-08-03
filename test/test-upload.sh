@@ -1,38 +1,41 @@
 #!/bin/bash
-
-# Script to upload test image to S3
+# test-upload.sh - Upload test images to S3
 
 set -e
 
-echo "Image Processing Pipeline - Test Upload Script"
-echo "================================================"
+echo "🚀 Image Processing Pipeline - Test Upload"
+echo "=========================================="
 
-# Get bucket name from Terraform outputs
+# Get bucket name
 cd "$(dirname "$0")/.."
 cd terraform
-
 INPUT_BUCKET=$(terraform output -raw input_bucket 2>/dev/null) || {
-    echo "Error: Could not get input bucket name"
-    echo "Make sure Terraform has been deployed: cd terraform && terraform apply"
+    echo "❌ Error: Could not get input bucket. Run 'terraform apply' first."
     exit 1
 }
+cd ..
 
-echo "Input Bucket: $INPUT_BUCKET"
+# Default test image
+TEST_IMAGE="${1:-test/sample-image.jpg}"
 
-# Verify test image exists
-if [ ! -f "../test/sample-image.jpg" ]; then
-    echo "Error: Test image not found at test/sample-image.jpg"
+if [ ! -f "$TEST_IMAGE" ]; then
+    echo "❌ Error: Test image not found at $TEST_IMAGE"
     exit 1
 fi
 
-echo "Uploading test image..."
-aws s3 cp ../test/sample-image.jpg s3://image-processing-pipeline-input-920534282171/uploads/test-$(date +%s).jpg
+# Generate unique filename
+TIMESTAMP=$(date +%s)
+S3_KEY="uploads/test-${TIMESTAMP}.jpg"
 
-echo "Upload complete!"
+echo "📤 Uploading $TEST_IMAGE to s3://$INPUT_BUCKET/$S3_KEY..."
+aws s3 cp "$TEST_IMAGE" "s3://$INPUT_BUCKET/$S3_KEY"
+
+echo "✅ Upload complete!"
 echo ""
-echo "Processing should complete in 30-60 seconds..."
+echo "🔍 Expected processing time: 30-60 seconds"
 echo ""
-echo "To check results:"
-echo "  1. Check your email for SNS notification"
-echo "  2. Query DynamoDB: aws dynamodb scan --table-name image-processing-pipeline-results"
-echo "  3. List output S3: aws s3 ls s3://\$(terraform output -raw output_bucket)/results/"
+echo "📋 Verification commands:"
+echo "  1. Check email for SNS notification"
+echo "  2. Query results: aws dynamodb scan --table-name image-processing-pipeline-results"
+echo "  3. List outputs: aws s3 ls s3://$(terraform output -raw output_bucket)/results/"
+echo "  4. View logs: aws logs tail /aws/lambda/image-processing-pipeline-processor --follow"
