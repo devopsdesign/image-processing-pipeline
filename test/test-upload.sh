@@ -1,43 +1,28 @@
-#!/bin/bash
-# test-upload.sh - Auto-detect bucket from AWS (GitHub Actions Compatible)
+#!/usr/bin/env bash
+# Uploads a test image and tails the results. Reads bucket/table names from
+# terraform outputs, so run it from the repo root after `make deploy`.
+set -euo pipefail
 
-set -e
+PROJECT="${PROJECT:-cloudsight-intake}"
+IMAGE="${1:-test/sample-image.jpg}"
 
-echo "🚀 Image Processing Pipeline - Test Upload"
-echo "=========================================="
+INPUT_BUCKET="$(terraform -chdir=terraform output -raw input_bucket)"
+TABLE="$(terraform -chdir=terraform output -raw dynamodb_table)"
 
-# Auto-detect the input bucket by listing S3 buckets and filtering
-# This works because GitHub Actions deployed the bucket with a known prefix
-INPUT_BUCKET=$(aws s3 ls | grep "image-processing-pipeline-input" | awk '{print $3}' | head -n 1)
+[ -f "$IMAGE" ] || { echo "Test image not found: $IMAGE" >&2; exit 1; }
 
-if [ -z "$INPUT_BUCKET" ]; then
-    echo "❌ Error: Could not find input bucket automatically."
-    echo "   Please ensure the pipeline was deployed successfully."
-    echo "   Run 'aws s3 ls' to check available buckets."
-    exit 1
-fi
+KEY="uploads/test-$(date +%s)-$(basename "$IMAGE")"
+echo "Uploading $IMAGE -> s3://$INPUT_BUCKET/$KEY"
+aws s3 cp "$IMAGE" "s3://$INPUT_BUCKET/$KEY"
 
-echo "📦 Detected Input Bucket: $INPUT_BUCKET"
+echo
+echo "Tailing Lambda logs (Ctrl-C to stop)..."
+aws logs tail "/aws/lambda/${PROJECT}-processor" --follow --since 1m &
+TAIL_PID=$!
+sleep 20
+kill "$TAIL_PID" 2>/dev/null || true
 
-# Verify test image exists
-TEST_IMAGE="${1:-test/sample-image.jpg}"
-if [ ! -f "$TEST_IMAGE" ]; then
-    echo "❌ Error: Test image not found at $TEST_IMAGE"
-    exit 1
-fi
-
-# Generate unique filename
-TIMESTAMP=$(date +%s)
-S3_KEY="uploads/test-${TIMESTAMP}.jpg"
-
-echo "📤 Uploading $TEST_IMAGE to s3://$INPUT_BUCKET/$S3_KEY..."
-aws s3 cp "$TEST_IMAGE" "s3://$INPUT_BUCKET/$S3_KEY"
-
-echo "✅ Upload complete!"
-echo ""
-echo "🔍 Processing in 30-60 seconds..."
-echo ""
-echo "📋 Verification:"
-echo "   1. Check email for SNS notification"
-echo "   2. Check logs: aws logs tail /aws/lambda/image-processing-pipeline-processor --follow"
-echo "   3. Check DynamoDB: aws dynamodb scan --table-name image-processing-pipeline-results --query 'Items[*].{ID:image_id, Status:status}'"
+echo
+echo "DynamoDB rows:"
+aws dynamodb scan --table-name "$TABLE" \
+  --query 'Items[].{image_id:image_id.S,status:status.S,summary:summary.S}' --output table

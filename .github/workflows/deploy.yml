@@ -1,32 +1,71 @@
-name: Deploy to AWS
+name: CI / Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.10.5"
+  PYTHON_VERSION: "3.11"
+  TF_STATE_KEY: "cloudsight-intake/terraform.tfstate"
+
 jobs:
-  deploy:
+  test:
+    name: Lint & test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      id-token: write
-      contents: read
-
+    env:
+      AWS_XRAY_SDK_ENABLED: "false"
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r lambda/requirements.txt -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check lambda tests app
+
+      - name: Pytest
+        run: pytest
+
+      - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.5.0
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt / validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  deploy:
+    name: Terraform apply
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: deploy-cloudsight
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -35,52 +74,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Package Lambda function
-        run: |
-          cd lambda
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -t .
-          zip -r ../lambda_function.zip .
-          cd ..
+      - name: Build Lambda package
+        run: bash scripts/build_lambda.sh
 
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive terraform/
-        continue-on-error: true
-
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
-
-      - name: Terraform Validate
-        working-directory: terraform
-        run: terraform validate
-
-      - name: Terraform Plan
-        working-directory: terraform
-        run: terraform plan -out=tfplan -var="sns_email=${{ secrets.SNS_EMAIL }}"
-
-      - name: Terraform Apply
-        working-directory: terraform
-        run: terraform apply -auto-approve tfplan
-
-      - name: Get outputs
-        id: outputs
+      - name: Terraform init (S3 backend)
         working-directory: terraform
         run: |
-          INPUT_BUCKET=$(terraform output -raw input_bucket 2>/dev/null | tr -d '[:space:]')
-          LAMBDA_NAME=$(terraform output -raw lambda_function_name 2>/dev/null | tr -d '[:space:]')
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
 
-          echo "input_bucket=$INPUT_BUCKET" >> "$GITHUB_OUTPUT"
-          echo "lambda_name=$LAMBDA_NAME" >> "$GITHUB_OUTPUT"
-
-          echo "DEBUG: Captured input_bucket: $INPUT_BUCKET" >&2
-          echo "DEBUG: Captured lambda_name: $LAMBDA_NAME" >&2
+      - name: Terraform apply
+        working-directory: terraform
         env:
-          TF_IN_AUTOMATION: true
-          TF_INPUT: false
+          TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
+          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+          TF_VAR_use_rekognition: ${{ vars.USE_REKOGNITION || 'false' }}
+        run: terraform apply -auto-approve -input=false
 
-      - name: Show deployment summary
-        run: |
-          echo "Lambda function deployed: ${{ steps.outputs.outputs.lambda_name }}"
-          echo "Input bucket: ${{ steps.outputs.outputs.input_bucket }}"
-          echo "This deployment stays intentionally lightweight for a portfolio/demo setup."
+      - name: Show outputs
+        working-directory: terraform
+        run: terraform output

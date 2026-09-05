@@ -1,9 +1,18 @@
 terraform {
-  required_version = ">= 1.0"
+  required_version = ">= 1.5"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
     }
   }
 }
@@ -12,60 +21,36 @@ provider "aws" {
   region = var.aws_region
 }
 
-# ============================================================================
-# VARIABLES
-# ============================================================================
-
-variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "us-east-1"
-}
-
-variable "project_name" {
-  description = "Project name"
-  type        = string
-  default     = "image-processing-pipeline"
-}
-
-variable "sns_email" {
-  description = "Email for SNS notifications"
-  type        = string
-  sensitive   = true
-}
-
-# ============================================================================
-# DATA SOURCES
-# ============================================================================
-
 data "aws_caller_identity" "current" {}
 
-# ============================================================================
-# S3 BUCKETS
-# ============================================================================
+locals {
+  name        = var.project_name
+  account_id  = data.aws_caller_identity.current.account_id
+  lambda_name = "${var.project_name}-processor"
+  image_types = [".jpg", ".jpeg", ".png", ".gif"]
 
-resource "aws_s3_bucket" "input_bucket" {
-  bucket = "${var.project_name}-input-${data.aws_caller_identity.current.account_id}"
-
-  tags = {
-    Name    = "${var.project_name}-input"
-    Project = "PortfolioDemo"
-  }
+  tags = merge({
+    Project   = "CloudSight Intake"
+    ManagedBy = "Terraform"
+  }, var.tags)
 }
 
-resource "aws_s3_bucket" "output_bucket" {
-  bucket = "${var.project_name}-output-${data.aws_caller_identity.current.account_id}"
+# ---------------------------------------------------------------------------
+# S3 buckets
+# ---------------------------------------------------------------------------
 
-  tags = {
-    Name    = "${var.project_name}-output"
-    Project = "PortfolioDemo"
-  }
+resource "aws_s3_bucket" "input" {
+  bucket = "${local.name}-input-${local.account_id}"
+  tags   = local.tags
 }
 
-# Block public access
+resource "aws_s3_bucket" "output" {
+  bucket = "${local.name}-output-${local.account_id}"
+  tags   = local.tags
+}
+
 resource "aws_s3_bucket_public_access_block" "input" {
-  bucket = aws_s3_bucket.input_bucket.id
-
+  bucket                  = aws_s3_bucket.input.id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -73,20 +58,36 @@ resource "aws_s3_bucket_public_access_block" "input" {
 }
 
 resource "aws_s3_bucket_public_access_block" "output" {
-  bucket = aws_s3_bucket.output_bucket.id
-
+  bucket                  = aws_s3_bucket.output.id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
 
-# S3 Lifecycle Rule to auto-purge uploads after 7 days (Free Tier Cost Protection)
-resource "aws_s3_bucket_lifecycle_configuration" "input_lifecycle" {
-  bucket = aws_s3_bucket.input_bucket.id
+resource "aws_s3_bucket_server_side_encryption_configuration" "input" {
+  bucket = aws_s3_bucket.input.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "output" {
+  bucket = aws_s3_bucket.output.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "input" {
+  bucket = aws_s3_bucket.input.id
 
   rule {
-    id     = "expire-demo-uploads"
+    id     = "purge-uploads"
     status = "Enabled"
 
     filter {
@@ -94,222 +95,255 @@ resource "aws_s3_bucket_lifecycle_configuration" "input_lifecycle" {
     }
 
     expiration {
-      days = 7
+      days = var.input_retention_days
     }
   }
 }
 
-# S3 Event Notification
-resource "aws_s3_bucket_notification" "input_notification" {
-  bucket     = aws_s3_bucket.input_bucket.id
-  depends_on = [aws_lambda_permission.s3_invoke]
+# ---------------------------------------------------------------------------
+# Lambda package (pip install + zip, driven by scripts/build_lambda.sh)
+# ---------------------------------------------------------------------------
 
-  # Block for JPG
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.processor.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "uploads/"
-    filter_suffix       = ".jpg"
+resource "null_resource" "lambda_build" {
+  triggers = {
+    source       = filesha256("${path.module}/../lambda/index.py")
+    requirements = filesha256("${path.module}/../lambda/requirements.txt")
+    builder      = filesha256("${path.module}/../scripts/build_lambda.sh")
   }
 
-  # Block for JPEG
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.processor.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "uploads/"
-    filter_suffix       = ".jpeg"
-  }
-
-  # Block for PNG
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.processor.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "uploads/"
-    filter_suffix       = ".png"
-  }
-
-  # Block for GIF
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.processor.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "uploads/"
-    filter_suffix       = ".gif"
+  provisioner "local-exec" {
+    command     = "bash ${path.module}/../scripts/build_lambda.sh"
+    working_dir = path.module
   }
 }
 
-# ============================================================================
-# IAM ROLE FOR LAMBDA
-# ============================================================================
+data "archive_file" "lambda" {
+  type        = "zip"
+  source_dir  = "${path.module}/build"
+  output_path = "${path.module}/dist/lambda_function.zip"
+  depends_on  = [null_resource.lambda_build]
+}
 
-resource "aws_iam_role" "lambda_role" {
-  name = "${var.project_name}-lambda-role"
+# ---------------------------------------------------------------------------
+# IAM (least privilege)
+# ---------------------------------------------------------------------------
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    Name    = "${var.project_name}-lambda-role"
-    Project = "PortfolioDemo"
+data "aws_iam_policy_document" "lambda_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
   }
 }
 
-# S3 access policy
-resource "aws_iam_role_policy" "lambda_s3_policy" {
-  name = "${var.project_name}-lambda-s3"
-  role = aws_iam_role.lambda_role.id
+resource "aws_iam_role" "lambda" {
+  name               = "${local.name}-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  tags               = local.tags
+}
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:ListBucket"
-        ]
-        Resource = [
-          aws_s3_bucket.input_bucket.arn,
-          "${aws_s3_bucket.input_bucket.arn}/*"
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:PutObject"
-        ]
-        Resource = "${aws_s3_bucket.output_bucket.arn}/*"
-      }
+data "aws_iam_policy_document" "lambda" {
+  statement {
+    sid       = "ReadInputObjects"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.input.arn}/uploads/*"]
+  }
+
+  statement {
+    sid       = "WriteResultObjects"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.output.arn}/results/*"]
+  }
+
+  statement {
+    sid = "Rekognition"
+    actions = [
+      "rekognition:DetectLabels",
+      "rekognition:DetectText",
+      "rekognition:DetectFaces",
     ]
-  })
-}
+    resources = ["*"]
+  }
 
-# Rekognition access
-resource "aws_iam_role_policy" "lambda_rekognition_policy" {
-  name = "${var.project_name}-lambda-rekognition"
-  role = aws_iam_role.lambda_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "rekognition:DetectLabels",
-          "rekognition:DetectText",
-          "rekognition:DetectFaces"
-        ]
-        Resource = "*"
-      }
+  statement {
+    sid = "DynamoDBWriteAndDedupe"
+    actions = [
+      "dynamodb:PutItem",
+      "dynamodb:GetItem",
+      "dynamodb:Query",
     ]
-  })
-}
-
-# DynamoDB access
-resource "aws_iam_role_policy" "lambda_dynamodb_policy" {
-  name = "${var.project_name}-lambda-dynamodb"
-  role = aws_iam_role.lambda_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "dynamodb:PutItem",
-          "dynamodb:GetItem",
-          "dynamodb:Query"
-        ]
-        Resource = aws_dynamodb_table.results.arn
-      }
+    resources = [
+      aws_dynamodb_table.results.arn,
+      "${aws_dynamodb_table.results.arn}/index/*",
     ]
-  })
-}
+  }
 
-# SNS publish
-resource "aws_iam_role_policy" "lambda_sns_policy" {
-  name = "${var.project_name}-lambda-sns"
-  role = aws_iam_role.lambda_role.id
+  statement {
+    sid       = "PublishNotifications"
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.notifications.arn]
+  }
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "sns:Publish"
-        ]
-        Resource = aws_sns_topic.notifications.arn
-      }
+  statement {
+    sid       = "SendToDeadLetterQueue"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.dlq.arn]
+  }
+
+  statement {
+    sid = "XRayTracing"
+    actions = [
+      "xray:PutTraceSegments",
+      "xray:PutTelemetryRecords",
     ]
-  })
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "ScopedLogging"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.lambda.arn}:*"]
+  }
 }
 
-# CloudWatch logs
-resource "aws_iam_role_policy_attachment" "lambda_logs" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+resource "aws_iam_role_policy" "lambda" {
+  name   = "${local.name}-lambda-policy"
+  role   = aws_iam_role.lambda.id
+  policy = data.aws_iam_policy_document.lambda.json
 }
 
-# ============================================================================
-# LAMBDA FUNCTION
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Lambda function
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/${local.lambda_name}"
+  retention_in_days = var.log_retention_days
+  tags              = local.tags
+}
+
 resource "aws_lambda_function" "processor" {
-  filename         = "../lambda_function.zip"
-  function_name    = "${var.project_name}-processor"
-  role             = aws_iam_role.lambda_role.arn
+  function_name    = local.lambda_name
+  role             = aws_iam_role.lambda.arn
   handler          = "index.handler"
-  source_code_hash = filebase64sha256("../lambda_function.zip")
   runtime          = "python3.11"
-  timeout          = 15
+  architectures    = ["x86_64"]
   memory_size      = 128
+  timeout          = 15
+  filename         = data.archive_file.lambda.output_path
+  source_code_hash = data.archive_file.lambda.output_base64sha256
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.dlq.arn
+  }
 
   environment {
     variables = {
-      OUTPUT_BUCKET   = aws_s3_bucket.output_bucket.id
+      OUTPUT_BUCKET   = aws_s3_bucket.output.id
       DYNAMODB_TABLE  = aws_dynamodb_table.results.name
       SNS_TOPIC_ARN   = aws_sns_topic.notifications.arn
-      USE_REKOGNITION = "true" # Explicitly enabled for live interviewer AI telemetry demo
+      USE_REKOGNITION = tostring(var.use_rekognition)
     }
   }
 
-  tags = {
-    Name    = "${var.project_name}-processor"
-    Project = "PortfolioDemo"
-  }
+  tags = local.tags
 
   depends_on = [
-    aws_iam_role.lambda_role,
-    aws_iam_role_policy.lambda_sns_policy,
-    aws_s3_bucket.output_bucket,
-    aws_dynamodb_table.results,
-    aws_sns_topic.notifications
+    aws_iam_role_policy.lambda,
+    aws_cloudwatch_log_group.lambda,
   ]
 }
 
-resource "aws_lambda_permission" "s3_invoke" {
-  statement_id  = "AllowS3Invoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.processor.function_name
-  principal     = "s3.amazonaws.com"
-  source_arn    = aws_s3_bucket.input_bucket.arn
+resource "aws_lambda_function_event_invoke_config" "processor" {
+  function_name                = aws_lambda_function.processor.function_name
+  maximum_retry_attempts       = 2
+  maximum_event_age_in_seconds = 3600
 }
 
-# ============================================================================
-# DYNAMODB TABLE
-# ============================================================================
+resource "aws_lambda_permission" "s3" {
+  statement_id   = "AllowS3Invoke"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.processor.function_name
+  principal      = "s3.amazonaws.com"
+  source_arn     = aws_s3_bucket.input.arn
+  source_account = local.account_id
+}
+
+resource "aws_s3_bucket_notification" "input" {
+  bucket = aws_s3_bucket.input.id
+
+  dynamic "lambda_function" {
+    for_each = toset(local.image_types)
+    content {
+      lambda_function_arn = aws_lambda_function.processor.arn
+      events              = ["s3:ObjectCreated:*"]
+      filter_prefix       = "uploads/"
+      filter_suffix       = lambda_function.value
+    }
+  }
+
+  depends_on = [aws_lambda_permission.s3]
+}
+
+# ---------------------------------------------------------------------------
+# SQS dead-letter queue + backlog alarm
+# ---------------------------------------------------------------------------
+
+resource "aws_sqs_queue" "dlq" {
+  name                      = "${local.name}-dlq"
+  message_retention_seconds = 1209600 # 14 days
+  tags                      = local.tags
+}
+
+resource "aws_sqs_queue_policy" "dlq" {
+  queue_url = aws_sqs_queue.dlq.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.dlq.arn
+      Condition = {
+        ArnEquals = { "aws:SourceArn" = aws_lambda_function.processor.arn }
+      }
+    }]
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "dlq_backlog" {
+  alarm_name          = "${local.name}-dlq-backlog"
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  dimensions          = { QueueName = aws_sqs_queue.dlq.name }
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = var.dlq_alarm_threshold
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "Async Lambda invocations are failing and landing in the DLQ."
+  alarm_actions       = [aws_sns_topic.notifications.arn]
+  ok_actions          = [aws_sns_topic.notifications.arn]
+  tags                = local.tags
+}
+
+# ---------------------------------------------------------------------------
+# DynamoDB
+# ---------------------------------------------------------------------------
 
 resource "aws_dynamodb_table" "results" {
-  name         = "${var.project_name}-results"
+  name         = "${local.name}-results"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "image_id"
   range_key    = "timestamp"
@@ -332,26 +366,20 @@ resource "aws_dynamodb_table" "results" {
   global_secondary_index {
     name            = "StatusIndex"
     hash_key        = "status"
+    range_key       = "timestamp"
     projection_type = "ALL"
   }
 
-  tags = {
-    Name    = "${var.project_name}-results"
-    Project = "PortfolioDemo"
-  }
+  tags = local.tags
 }
 
-# ============================================================================
-# SNS TOPIC
-# ============================================================================
+# ---------------------------------------------------------------------------
+# SNS
+# ---------------------------------------------------------------------------
 
 resource "aws_sns_topic" "notifications" {
-  name = "${var.project_name}-notifications"
-
-  tags = {
-    Name    = "${var.project_name}-notifications"
-    Project = "PortfolioDemo"
-  }
+  name = "${local.name}-notifications"
+  tags = local.tags
 }
 
 resource "aws_sns_topic_subscription" "email" {
@@ -360,45 +388,84 @@ resource "aws_sns_topic_subscription" "email" {
   endpoint  = var.sns_email
 }
 
-# ============================================================================
-# CLOUDWATCH LOG GROUP
-# ============================================================================
+# ---------------------------------------------------------------------------
+# CloudWatch dashboard
+# ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_log_group" "lambda_logs" {
-  name              = "/aws/lambda/${aws_lambda_function.processor.function_name}"
-  retention_in_days = 7
+resource "aws_cloudwatch_dashboard" "main" {
+  dashboard_name = "${local.name}-dashboard"
 
-  tags = {
-    Name    = "${var.project_name}-lambda-logs"
-    Project = "PortfolioDemo"
-  }
-}
-
-# ============================================================================
-# OUTPUTS
-# ============================================================================
-
-output "input_bucket" {
-  description = "S3 input bucket name"
-  value       = aws_s3_bucket.input_bucket.id
-}
-
-output "output_bucket" {
-  description = "S3 output bucket name"
-  value       = aws_s3_bucket.output_bucket.id
-}
-
-output "dynamodb_table" {
-  description = "DynamoDB table name"
-  value       = aws_dynamodb_table.results.name
-}
-
-output "sns_topic_arn" {
-  description = "SNS topic ARN"
-  value       = aws_sns_topic.notifications.arn
-}
-
-output "lambda_function_name" {
-  description = "Lambda function name"
-  value       = aws_lambda_function.processor.function_name
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Lambda invocations / errors / throttles"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = false
+          period  = 300
+          metrics = [
+            ["AWS/Lambda", "Invocations", "FunctionName", local.lambda_name, { stat = "Sum" }],
+            ["AWS/Lambda", "Errors", "FunctionName", local.lambda_name, { stat = "Sum" }],
+            ["AWS/Lambda", "Throttles", "FunctionName", local.lambda_name, { stat = "Sum" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Lambda duration (ms)"
+          region = var.aws_region
+          view   = "timeSeries"
+          period = 300
+          metrics = [
+            ["AWS/Lambda", "Duration", "FunctionName", local.lambda_name, { stat = "Average", label = "avg" }],
+            ["AWS/Lambda", "Duration", "FunctionName", local.lambda_name, { stat = "p99", label = "p99" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 6
+        width  = 12
+        height = 6
+        properties = {
+          title  = "DynamoDB consumed capacity units"
+          region = var.aws_region
+          view   = "timeSeries"
+          period = 300
+          metrics = [
+            ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", aws_dynamodb_table.results.name, { stat = "Sum" }],
+            ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", aws_dynamodb_table.results.name, { stat = "Sum" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 6
+        width  = 12
+        height = 6
+        properties = {
+          title  = "DLQ backlog (failed async invocations)"
+          region = var.aws_region
+          view   = "timeSeries"
+          period = 300
+          metrics = [
+            ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", aws_sqs_queue.dlq.name, { stat = "Maximum" }],
+          ]
+        }
+      },
+    ]
+  })
 }

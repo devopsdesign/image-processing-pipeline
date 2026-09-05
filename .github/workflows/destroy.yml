@@ -1,35 +1,34 @@
-name: Destroy Infrastructure
+name: Destroy
 
 on:
   workflow_dispatch:
     inputs:
-      confirm_destroy:
-        description: 'Type "YES" to confirm destruction'
+      confirm:
+        description: 'Type "destroy" to confirm teardown'
         required: true
-        default: 'NO'
+        default: "no"
+
+permissions:
+  contents: read
 
 jobs:
   destroy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
+    environment: production
+    concurrency: deploy-cloudsight
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Validate Confirmation
+      - name: Check confirmation
         run: |
-          if [ "${{ github.event.inputs.confirm_destroy }}" != "YES" ]; then
-            echo "❌ Destruction cancelled. Please type 'YES' in the workflow inputs to proceed."
+          if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
+            echo "Confirmation not given. Aborting."
             exit 1
           fi
-          echo "✅ Confirmation received. Starting destruction..."
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.5.0
+          terraform_version: "1.9.8"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -38,107 +37,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Generates a valid zip file so filebase64sha256() does not crash during evaluation
-      - name: Generate Mock Lambda Zip for Validation
+      - name: Terraform init (S3 backend)
+        working-directory: terraform
         run: |
-          echo "// temporary placeholder for destroy" > index.js
-          zip lambda_function.zip index.js
+          terraform init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=cloudsight-intake/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
 
-      - name: Terraform Init
+      - name: Empty S3 buckets
+        working-directory: terraform
         run: |
-          cd terraform
-          terraform init
+          for out in input_bucket output_bucket; do
+            name=$(terraform output -raw "$out" 2>/dev/null || true)
+            [ -n "$name" ] && aws s3 rm "s3://$name" --recursive || true
+          done
 
-      # Imports resources into ephemeral memory so Terraform tracks them before destroying
-      - name: Import Existing Resources to State Memory
-        run: |
-          cd terraform
-          echo "🔄 Importing resources..."
-          terraform import -input=false aws_s3_bucket.input_bucket image-processing-pipeline-input-920534282171 || true
-          terraform import -input=false aws_s3_bucket.output_bucket image-processing-pipeline-output-920534282171 || true
-          terraform import -input=false aws_iam_role.lambda_role image-processing-pipeline-lambda-role || true
-          terraform import -input=false aws_dynamodb_table.results image-processing-pipeline-results || true
-          terraform import -input=false aws_cloudwatch_log_group.lambda_logs /aws/lambda/image-processing-pipeline-processor || true
-          terraform import -input=false aws_lambda_function.processor image-processing-pipeline-processor || true
-          terraform import -input=false aws_s3_bucket_notification.input_notification image-processing-pipeline-input-920534282171 || true
-          terraform import -input=false aws_sns_topic.notifications arn:aws:sns:us-east-1:920534282171:image-processing-pipeline-notifications || true
-          terraform import -input=false aws_sns_topic_subscription.email arn:aws:sns:us-east-1:920534282171:image-processing-pipeline-notifications:$(aws sns list-subscriptions-by-topic --topic-arn arn:aws:sns:us-east-1:920534282171:image-processing-pipeline-notifications --query "Subscriptions[0].SubscriptionArn" --output text) || true
+      - name: Terraform destroy
+        working-directory: terraform
         env:
           TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
-
-      # 🚀 Clear out all test images and JSON files to prevent BucketNotEmpty errors
-      - name: Force Purge S3 Objects
-        run: |
-          echo "🧹 Purging S3 buckets..."
-          aws s3 rm s3://image-processing-pipeline-input-920534282171 --recursive || echo "⚠️ Input bucket empty or not found"
-          aws s3 rm s3://image-processing-pipeline-output-920534282171 --recursive || echo "⚠️ Output bucket empty or not found"
-          echo "✅ S3 buckets purged."
-
-      # Executes the absolute teardown
-      - name: Terraform Destroy
-        id: destroy_step
-        run: |
-          echo "💣 Starting Terraform destroy..."
-          cd terraform
-          terraform destroy -auto-approve -var="sns_email=${{ secrets.SNS_EMAIL }}"
-          echo "status=success" >> $GITHUB_OUTPUT
-        continue-on-error: true
-
-      # 📊 COMPREHENSIVE SUMMARY STEP
-      - name: Generate Destruction Summary
-        id: summary
-        run: |
-          echo "📊 === DESTRUCTION SUMMARY ===" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Check Terraform status
-          if [ "${{ steps.destroy_step.outputs.status }}" == "success" ]; then
-            echo "✅ **Status**: Infrastructure Destroyed Successfully" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ **Status**: Partial Success (Check logs for errors)" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Check for remaining resources (Manual Verification)
-          echo "### 🔍 Manual Verification Checklist" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Check S3
-          s3_buckets=$(aws s3 ls | grep "image-processing-pipeline" | wc -l)
-          if [ "$s3_buckets" -gt 0 ]; then
-            echo "- ❌ **S3 Buckets**: $s3_buckets bucket(s) still exist. Run manual cleanup." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- ✅ **S3 Buckets**: All deleted." >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Check Lambda
-          lambda_count=$(aws lambda list-functions --query "Functions[?contains(FunctionName, 'image-processing-pipeline')].FunctionName" --output text | wc -w)
-          if [ "$lambda_count" -gt 0 ]; then
-            echo "- ❌ **Lambda Functions**: $lambda_count function(s) still exist." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- ✅ **Lambda Functions**: All deleted." >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Check DynamoDB
-          db_count=$(aws dynamodb list-tables --query "TableNames[?contains(@, 'image-processing-pipeline')]" --output text | wc -w)
-          if [ "$db_count" -gt 0 ]; then
-            echo "- ❌ **DynamoDB Tables**: $db_count table(s) still exist." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- ✅ **DynamoDB Tables**: All deleted." >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Check IAM Roles
-          iam_count=$(aws iam list-roles --query "Roles[?contains(RoleName, 'image-processing-pipeline')].RoleName" --output text | wc -w)
-          if [ "$iam_count" -gt 0 ]; then
-            echo "- ❌ **IAM Roles**: $iam_count role(s) still exist." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- ✅ **IAM Roles**: All deleted." >> $GITHUB_STEP_SUMMARY
-          fi
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📝 Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "If any items are marked ❌, visit the AWS Console to manually delete them." >> $GITHUB_STEP_SUMMARY
-          echo "You can also re-run this workflow if it failed due to transient errors." >> $GITHUB_STEP_SUMMARY
-          
-          echo "Summary generated at $(date)"
+          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+        run: terraform destroy -auto-approve -input=false

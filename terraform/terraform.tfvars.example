@@ -1,0 +1,3 @@
+aws_region      = "us-east-1"
+sns_email       = "you@example.com"
+use_rekognition = false
