@@ -12,7 +12,8 @@ permissions:
 env:
   TF_VERSION: "1.10.5"
   PYTHON_VERSION: "3.11"
-  TF_STATE_KEY: "cloudsight-intake/terraform.tfstate"
+  # Region is not a secret. Set repo Variable OR Secret AWS_REGION to override.
+  AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'us-east-1' }}
 
 jobs:
   test:
@@ -54,7 +55,6 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    environment: production
     concurrency: deploy-cloudsight
     steps:
       - uses: actions/checkout@v4
@@ -67,12 +67,50 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Preflight - required config
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          SNS_EMAIL: ${{ secrets.SNS_EMAIL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -e
+          miss=0
+          [ -n "$AWS_ACCESS_KEY_ID" ]     || { echo "::error::Missing secret AWS_ACCESS_KEY_ID"; miss=1; }
+          [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "::error::Missing secret AWS_SECRET_ACCESS_KEY"; miss=1; }
+          [ -n "$TF_STATE_BUCKET" ]       || { echo "::error::Missing secret TF_STATE_BUCKET (e.g. cloudsight-tfstate-<ACCOUNT_ID>)"; miss=1; }
+          [ -n "$SNS_EMAIL" ]             || { echo "::error::Missing secret SNS_EMAIL"; miss=1; }
+          echo "Region: $AWS_REGION"
+          [ "$miss" -eq 0 ] || { echo "::error::Set the missing repository secrets under Settings -> Secrets and variables -> Actions"; exit 1; }
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure Terraform state bucket
+        env:
+          BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "State bucket already exists: $BUCKET"
+          else
+            echo "Creating state bucket $BUCKET in $AWS_REGION"
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" \
+                --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" \
+              --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
 
       - name: Build Lambda package
         run: bash scripts/build_lambda.sh
@@ -80,21 +118,33 @@ jobs:
       - name: Terraform init (S3 backend)
         working-directory: terraform
         run: |
-          terraform init -input=false \
+          terraform init -input=false -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=${TF_STATE_KEY}" \
-            -backend-config="region=${{ secrets.AWS_REGION }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="use_lockfile=true"
+            -backend-config="region=${AWS_REGION}"
 
       - name: Terraform apply
         working-directory: terraform
         env:
           TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
-          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
           TF_VAR_use_rekognition: ${{ vars.USE_REKOGNITION || 'false' }}
         run: terraform apply -auto-approve -input=false
 
-      - name: Show outputs
+      - name: Publish outputs to run summary
         working-directory: terraform
-        run: terraform output
+        run: |
+          IN=$(terraform output -raw input_bucket)
+          OUT=$(terraform output -raw output_bucket)
+          TBL=$(terraform output -raw dynamodb_table)
+          {
+            echo "## CloudSight Intake deployed"
+            echo ""
+            echo "Paste these into the Streamlit app's **Secrets** panel:"
+            echo ""
+            echo '```toml'
+            echo "AWS_REGION     = \"${AWS_REGION}\""
+            echo "INPUT_BUCKET   = \"${IN}\""
+            echo "OUTPUT_BUCKET  = \"${OUT}\""
+            echo "DYNAMODB_TABLE = \"${TBL}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

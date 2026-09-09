@@ -1,5 +1,4 @@
-bucket       = "cloudsight-tfstate-000000000000"
-key          = "cloudsight-intake/terraform.tfstate"
-region       = "us-east-1"
-encrypt      = true
-use_lockfile = true
+# For local runs only:  terraform init -backend-config=backend.hcl
+# CI passes bucket + region as -backend-config flags instead (see deploy.yml).
+bucket = "cloudsight-tfstate-000000000000"
+region = "us-east-1"
