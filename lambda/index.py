@@ -13,6 +13,9 @@ import json
 import logging
 import os
 from datetime import UTC, datetime
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import boto3
 from aws_xray_sdk.core import patch_all
@@ -29,12 +32,16 @@ OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
 DYNAMODB_TABLE = os.environ["DYNAMODB_TABLE"]
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 USE_REKOGNITION = os.environ.get("USE_REKOGNITION", "false").lower() == "true"
+SES_FROM = os.environ.get("SES_FROM")
+NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL") or SES_FROM
 
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif")
+MAX_INLINE_BYTES = 6_000_000  # keep the SES raw message under the 10 MB limit
 
 s3 = boto3.client("s3")
 rekognition = boto3.client("rekognition")
 sns = boto3.client("sns")
+ses = boto3.client("ses")
 table = boto3.resource("dynamodb").Table(DYNAMODB_TABLE)
 
 
@@ -90,30 +97,24 @@ def _process_record(record):
                 "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600
             )
         except ClientError:
-            preview_url = "(unavailable)"
+            preview_url = ""
 
-        if analysis["labels"]:
-            labels_line = "Labels:   " + ", ".join(
-                f"{lab['name']} {lab['confidence']}%" for lab in analysis["labels"]
-            )
-        elif analysis["mode"].startswith("metadata"):
-            labels_line = "Labels:   (none - Rekognition disabled, metadata-only mode)"
-        else:
-            labels_line = "Labels:   (none detected)"
-
-        _publish(
-            subject=f"[CloudSight] processed {key[:60]}",
-            message=(
-                "CloudSight Intake - image processed\n\n"
-                f"Image:    {key}\n"
-                f"ETag:     {image_id}\n"
-                f"Status:   {analysis['status']} ({analysis['mode']})\n"
-                f"Summary:  {summary}\n"
-                f"{labels_line}\n"
-                f"Result:   s3://{OUTPUT_BUCKET}/{result_key}\n\n"
-                f"Image preview (SigV4 link, valid ~1 hour):\n{preview_url}\n"
-            ),
+        subject = f"[CloudSight] processed {key.rsplit('/', 1)[-1]}"[:100]
+        plain_body = (
+            "CloudSight Intake - image processed\n\n"
+            f"Image:    {key}\n"
+            f"ETag:     {image_id}\n"
+            f"Status:   {analysis['status']} ({analysis['mode']})\n"
+            f"Summary:  {summary}\n"
+            f"{_labels_line(analysis)}\n"
+            f"Result:   s3://{OUTPUT_BUCKET}/{result_key}\n"
+            + (f"\nFull-size image (SigV4 link, ~1h):\n{preview_url}\n" if preview_url else "")
         )
+
+        # Rich HTML email with the image embedded inline; SNS plain-text is the fallback.
+        if not _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summary, result_key):
+            _publish(subject=subject, message=plain_body)
+
         return {"key": key, "image_id": image_id, "status": "processed", "summary": summary}
 
     except Exception as exc:  # noqa: BLE001 - notify, then let the DLQ catch it
@@ -194,3 +195,79 @@ def _publish(subject, message, best_effort=False):
         if not best_effort:
             raise
         logger.error("SNS publish failed", exc_info=True)
+
+
+def _labels_line(analysis):
+    if analysis["labels"]:
+        return "Labels:   " + ", ".join(f"{x['name']} {x['confidence']}%" for x in analysis["labels"])
+    if analysis["mode"].startswith("metadata"):
+        return "Labels:   (none - Rekognition disabled, metadata-only mode)"
+    return "Labels:   (none detected)"
+
+
+def _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summary, result_key):
+    """HTML email with the uploaded image embedded inline (CID). True if SES sent it."""
+    if not SES_FROM:
+        return False
+    try:
+        img_bytes = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except ClientError:
+        logger.warning("Could not read image for rich email", exc_info=True)
+        return False
+
+    inline = len(img_bytes) <= MAX_INLINE_BYTES
+    subtype = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif"}.get(
+        key.rsplit(".", 1)[-1].lower(), "jpeg"
+    )
+    rows = "".join(
+        f"<tr><td style='padding:2px 14px 2px 0'>{x['name']}</td>"
+        f"<td style='padding:2px 0;color:#6b7280'>{x['confidence']}%</td></tr>"
+        for x in analysis["labels"]
+    ) or "<tr><td style='color:#6b7280'>none</td></tr>"
+    img_html = (
+        "<img src='cid:preview' alt='uploaded image' "
+        "style='max-width:480px;border-radius:8px;border:1px solid #e5e7eb'>"
+        if inline
+        else "<p style='color:#6b7280'>(image too large to embed inline)</p>"
+    )
+    html = (
+        "<html><body style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#111827\">"
+        "<h2 style='margin:0 0 2px'>CloudSight Intake &mdash; image processed</h2>"
+        f"<p style='margin:0 0 12px;color:#6b7280'>{key}</p>"
+        f"{img_html}"
+        "<table style='margin:14px 0;border-collapse:collapse;font-size:14px'>"
+        "<tr><td style='padding:2px 14px 2px 0'><b>Status</b></td>"
+        f"<td>{analysis['status']} ({analysis['mode']})</td></tr>"
+        f"<tr><td style='padding:2px 14px 2px 0'><b>Summary</b></td><td>{summary}</td></tr>"
+        f"<tr><td style='padding:2px 14px 2px 0'><b>ETag</b></td><td>{image_id}</td></tr>"
+        "</table>"
+        "<h3 style='margin:8px 0 4px'>Labels</h3>"
+        f"<table style='border-collapse:collapse;font-size:14px'>{rows}</table>"
+        f"<p style='margin:14px 0 0;font-size:12px;color:#9ca3af'>Result JSON: "
+        f"s3://{OUTPUT_BUCKET}/{result_key}</p>"
+        "</body></html>"
+    )
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = subject
+    msg["From"] = SES_FROM
+    msg["To"] = NOTIFY_EMAIL
+    alt = MIMEMultipart("alternative")
+    msg.attach(alt)
+    alt.attach(MIMEText(plain_body, "plain"))
+    alt.attach(MIMEText(html, "html"))
+    if inline:
+        part = MIMEImage(img_bytes, _subtype=subtype)
+        part.add_header("Content-ID", "<preview>")
+        part.add_header("Content-Disposition", "inline", filename=key.rsplit("/", 1)[-1])
+        msg.attach(part)
+
+    try:
+        ses.send_raw_email(
+            Source=SES_FROM, Destinations=[NOTIFY_EMAIL], RawMessage={"Data": msg.as_string()}
+        )
+        logger.info("Rich email sent via SES to %s", NOTIFY_EMAIL)
+        return True
+    except ClientError:
+        logger.warning("SES send failed - falling back to SNS", exc_info=True)
+        return False

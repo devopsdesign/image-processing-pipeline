@@ -187,6 +187,17 @@ data "aws_iam_policy_document" "lambda" {
   }
 
   statement {
+    sid       = "SendRichEmail"
+    actions   = ["ses:SendRawEmail"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ses:FromAddress"
+      values   = [var.sns_email]
+    }
+  }
+
+  statement {
     sid       = "SendToDeadLetterQueue"
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.dlq.arn]
@@ -252,6 +263,8 @@ resource "aws_lambda_function" "processor" {
       DYNAMODB_TABLE  = aws_dynamodb_table.results.name
       SNS_TOPIC_ARN   = aws_sns_topic.notifications.arn
       USE_REKOGNITION = tostring(var.use_rekognition)
+      SES_FROM        = var.sns_email
+      NOTIFY_EMAIL    = var.sns_email
     }
   }
 
@@ -386,6 +399,17 @@ resource "aws_sns_topic_subscription" "email" {
   topic_arn = aws_sns_topic.notifications.arn
   protocol  = "email"
   endpoint  = var.sns_email
+}
+
+# ---------------------------------------------------------------------------
+# SES - used by the Lambda to send the HTML "image processed" email with the
+# image embedded inline (SNS email is plain-text only). Sandbox mode is fine:
+# from == to == var.sns_email, so verifying this one identity covers both.
+# AWS emails a verification link on first apply - click it before rich emails work.
+# ---------------------------------------------------------------------------
+
+resource "aws_ses_email_identity" "notify" {
+  email = var.sns_email
 }
 
 # ---------------------------------------------------------------------------

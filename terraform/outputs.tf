@@ -23,6 +23,11 @@ output "sns_confirmation_reminder" {
   value       = "Check ${var.sns_email} for 'AWS Notification - Subscription Confirmation' and click the link. Verify with: aws sns list-subscriptions-by-topic --topic-arn ${aws_sns_topic.notifications.arn} --query 'Subscriptions[].SubscriptionArn'"
 }
 
+output "ses_verification_reminder" {
+  description = "Rich HTML email (inline image + labels) needs this SES identity verified."
+  value       = "Check ${var.sns_email} for 'Amazon Web Services - Email Address Verification Request' and click the link. Verify with: aws ses get-identity-verification-attributes --identities ${var.sns_email}"
+}
+
 output "dlq_url" {
   description = "SQS dead-letter queue URL for failed async Lambda invocations."
   value       = aws_sqs_queue.dlq.id

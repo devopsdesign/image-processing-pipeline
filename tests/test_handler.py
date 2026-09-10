@@ -6,40 +6,60 @@ import pytest
 from moto import mock_aws
 
 REGION = "us-east-1"
+SES_ADDR = "notify@example.com"
 
 
-@pytest.fixture
-def index(monkeypatch):
+def _provision(with_ses):
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.create_bucket(Bucket="in-bucket")
+    s3.create_bucket(Bucket="out-bucket")
+
+    boto3.client("dynamodb", region_name=REGION).create_table(
+        TableName="results",
+        BillingMode="PAY_PER_REQUEST",
+        KeySchema=[
+            {"AttributeName": "image_id", "KeyType": "HASH"},
+            {"AttributeName": "timestamp", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "image_id", "AttributeType": "S"},
+            {"AttributeName": "timestamp", "AttributeType": "S"},
+        ],
+    )
+    boto3.client("sns", region_name=REGION).create_topic(Name="cloudsight")
+    if with_ses:
+        boto3.client("ses", region_name=REGION).verify_email_identity(EmailAddress=SES_ADDR)
+
+
+def _load(monkeypatch, with_ses):
     monkeypatch.setenv("AWS_XRAY_SDK_ENABLED", "false")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     monkeypatch.setenv("OUTPUT_BUCKET", "out-bucket")
     monkeypatch.setenv("DYNAMODB_TABLE", "results")
     monkeypatch.setenv("SNS_TOPIC_ARN", f"arn:aws:sns:{REGION}:123456789012:cloudsight")
     monkeypatch.setenv("USE_REKOGNITION", "false")
+    if with_ses:
+        monkeypatch.setenv("SES_FROM", SES_ADDR)
+    else:
+        monkeypatch.delenv("SES_FROM", raising=False)
+    import index as _index
 
+    importlib.reload(_index)
+    return _index
+
+
+@pytest.fixture
+def index(monkeypatch):
     with mock_aws():
-        s3 = boto3.client("s3", region_name=REGION)
-        s3.create_bucket(Bucket="in-bucket")
-        s3.create_bucket(Bucket="out-bucket")
+        _provision(with_ses=False)
+        yield _load(monkeypatch, with_ses=False)
 
-        boto3.client("dynamodb", region_name=REGION).create_table(
-            TableName="results",
-            BillingMode="PAY_PER_REQUEST",
-            KeySchema=[
-                {"AttributeName": "image_id", "KeyType": "HASH"},
-                {"AttributeName": "timestamp", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "image_id", "AttributeType": "S"},
-                {"AttributeName": "timestamp", "AttributeType": "S"},
-            ],
-        )
-        boto3.client("sns", region_name=REGION).create_topic(Name="cloudsight")
 
-        import index as _index
-
-        importlib.reload(_index)
-        yield _index
+@pytest.fixture
+def index_ses(monkeypatch):
+    with mock_aws():
+        _provision(with_ses=True)
+        yield _load(monkeypatch, with_ses=True)
 
 
 def _event(key="uploads/photo.jpg", etag="deadbeef"):
@@ -81,3 +101,16 @@ def test_missing_etag_falls_back_to_head_object(index):
 
     assert result["status"] == "processed"
     assert result["image_id"]
+
+
+def test_rich_email_sent_via_ses_when_configured(index_ses):
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket="in-bucket", Key="uploads/pic.jpg", Body=b"\xff\xd8\xff\xd9jpegbytes"
+    )
+    event = _event(key="uploads/pic.jpg", etag="cafef00d")
+
+    result = index_ses.handler(event, None)["processed"][0]
+    assert result["status"] == "processed"
+
+    quota = boto3.client("ses", region_name=REGION).get_send_quota()
+    assert quota["SentLast24Hours"] >= 1
