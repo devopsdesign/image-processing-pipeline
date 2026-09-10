@@ -11,9 +11,9 @@ on:
         type: boolean
         default: true
       use_rekognition:
-        description: Enable Amazon Rekognition (12-month free tier; off = always-free)
+        description: Enable Amazon Rekognition label/text/face detection (5,000 img/mo free for 12 months, then ~$1/1k)
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
