@@ -4,9 +4,14 @@ A production-shaped, fully serverless image-processing pipeline on AWS that stay
 inside the **AWS Always-Free tier** in its default configuration.
 
 Upload an image → S3 event → Lambda (X-Ray traced) → optional cascading Amazon
-Rekognition → summary in DynamoDB + full JSON in S3 → SNS notification. Failed
+Rekognition → summary in DynamoDB + full JSON in S3 → SES/SNS notification. Failed
 async invocations land in an SQS dead-letter queue with a CloudWatch alarm, and a
 CloudWatch dashboard tracks the whole thing.
+
+**Using it for wildlife / animal identification?** See
+[`docs/wildlife-identification.md`](docs/wildlife-identification.md) — the UI
+access point, a field guide for photographing animals so they identify well, and
+the full per-upload technical flow.
 
 ---
 
