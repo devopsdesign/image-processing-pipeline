@@ -127,19 +127,22 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------------- post-deploy image-processing test ----------------
-      - name: Generate a random test image
+      - name: Prepare test image
         if: ${{ inputs.run_test }}
         run: |
           python -m pip install --quiet pillow
           python - <<'PY'
           import os, random
           from PIL import Image
-          w, h = 480, 320
-          img = Image.new("RGB", (w, h))
-          img.putdata([(random.randrange(256), random.randrange(256), random.randrange(256)) for _ in range(w * h)])
-          path = "/tmp/cloudsight-test.jpg"
-          img.save(path, "JPEG", quality=85)
-          print("wrote", path, os.path.getsize(path), "bytes")
+          # A real photo so Rekognition has something to detect; one random pixel
+          # tweak per run keeps the ETag unique (no idempotency skip).
+          src = "test/sample-image2.jpg"
+          im = Image.open(src).convert("RGB")
+          im.putpixel((random.randrange(im.width), random.randrange(im.height)),
+                      tuple(random.randrange(256) for _ in range(3)))
+          out = "/tmp/cloudsight-test.jpg"
+          im.save(out, "JPEG", quality=90)
+          print("prepared", out, os.path.getsize(out), "bytes from", src)
           PY
 
       - name: Run image-processing test

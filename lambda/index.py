@@ -85,15 +85,33 @@ def _process_record(record):
             ContentType="application/json",
         )
 
+        try:
+            preview_url = s3.generate_presigned_url(
+                "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600
+            )
+        except ClientError:
+            preview_url = "(unavailable)"
+
+        if analysis["labels"]:
+            labels_line = "Labels:   " + ", ".join(
+                f"{lab['name']} {lab['confidence']}%" for lab in analysis["labels"]
+            )
+        elif analysis["mode"].startswith("metadata"):
+            labels_line = "Labels:   (none - Rekognition disabled, metadata-only mode)"
+        else:
+            labels_line = "Labels:   (none detected)"
+
         _publish(
             subject=f"[CloudSight] processed {key[:60]}",
             message=(
                 "CloudSight Intake - image processed\n\n"
-                f"Image:   {key}\n"
-                f"ETag:    {image_id}\n"
-                f"Status:  {analysis['status']} ({analysis['mode']})\n"
-                f"Summary: {summary}\n"
-                f"Result:  s3://{OUTPUT_BUCKET}/{result_key}\n"
+                f"Image:    {key}\n"
+                f"ETag:     {image_id}\n"
+                f"Status:   {analysis['status']} ({analysis['mode']})\n"
+                f"Summary:  {summary}\n"
+                f"{labels_line}\n"
+                f"Result:   s3://{OUTPUT_BUCKET}/{result_key}\n\n"
+                f"Image preview (SigV4 link, valid ~1 hour):\n{preview_url}\n"
             ),
         )
         return {"key": key, "image_id": image_id, "status": "processed", "summary": summary}
