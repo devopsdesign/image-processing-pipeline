@@ -18,6 +18,11 @@ output "sns_topic_arn" {
   value       = aws_sns_topic.notifications.arn
 }
 
+output "sns_confirmation_reminder" {
+  description = "Email notifications only arrive AFTER you confirm the subscription."
+  value       = "Check ${var.sns_email} for 'AWS Notification - Subscription Confirmation' and click the link. Verify with: aws sns list-subscriptions-by-topic --topic-arn ${aws_sns_topic.notifications.arn} --query 'Subscriptions[].SubscriptionArn'"
+}
+
 output "dlq_url" {
   description = "SQS dead-letter queue URL for failed async Lambda invocations."
   value       = aws_sqs_queue.dlq.id

@@ -81,43 +81,117 @@ opt-in.
 
 ## Prerequisites
 
-- Terraform ≥ 1.5, Python 3.11, AWS CLI configured with credentials that can
-  create the resources above.
-- An email address for SNS (you'll get a subscription-confirmation email).
+- Python 3.11 and (for local runs) Terraform ≥ 1.10, AWS CLI with credentials
+  that can create the resources above.
+- An email address for SNS — **you must click the confirmation link** or no
+  notifications are delivered (see [Troubleshooting](#troubleshooting)).
 
-## Quickstart
+## Deploy via GitHub Actions (recommended)
+
+The `deploy` job creates the Terraform state bucket itself, so no local terminal
+is needed.
+
+1. Repo → **Settings → Secrets and variables → Actions → Secrets**:
+
+   | Secret | Value |
+   |---|---|
+   | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | deploy IAM user (needs `s3:CreateBucket`, `s3:PutBucketVersioning`, `s3:PutBucketPublicAccessBlock` on top of the pipeline resources; `AdministratorAccess` is fine for a solo account) |
+   | `TF_STATE_BUCKET` | any globally-unique name, e.g. `cloudsight-tfstate-<account-id>` |
+   | `SNS_EMAIL` | notification address |
+   | `AWS_REGION` | optional; defaults to `us-east-1` (may be a Variable instead) |
+
+2. Push to `main`. Watch the run: `test` → `deploy`.
+3. Open the run's **Summary** — it prints the `INPUT_BUCKET` / `OUTPUT_BUCKET` /
+   `DYNAMODB_TABLE` names to paste into the Streamlit app's Secrets.
+4. **Confirm the SNS email** that AWS sends to `SNS_EMAIL`.
+
+## Deploy locally
 
 ```bash
 git clone <your-repo-url> cloudsight-intake && cd cloudsight-intake
 
-# 1. One-time remote-state bucket (S3 backend)
+# 1. One-time remote-state bucket
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 aws s3api create-bucket --bucket cloudsight-tfstate-$ACCOUNT --region us-east-1
 aws s3api put-bucket-versioning --bucket cloudsight-tfstate-$ACCOUNT \
   --versioning-configuration Status=Enabled
 
-# 2. Backend + vars
+# 2. Config
 cd terraform
-cp backend.hcl.example backend.hcl        # set bucket = cloudsight-tfstate-<ACCOUNT>
-cp terraform.tfvars.example terraform.tfvars   # set sns_email
+cp backend.hcl.example backend.hcl              # set bucket = cloudsight-tfstate-<ACCOUNT>, region
+cp terraform.tfvars.example terraform.tfvars    # set sns_email
+cd ..
 
 # 3. Deploy
-cd ..
-make deploy        # builds the Lambda zip, then terraform init + apply
-# or: bash scripts/build_lambda.sh && terraform -chdir=terraform init -backend-config=backend.hcl && terraform -chdir=terraform apply
+bash scripts/build_lambda.sh
+terraform -chdir=terraform init -backend-config=backend.hcl
+terraform -chdir=terraform apply
 ```
 
-Confirm the SNS subscription email that arrives, then test:
+Then confirm the SNS email and run the [functional test](#functional-testing).
+
+> For a throwaway run with no remote state, delete `terraform/backend.tf` and
+> `terraform init` with local state.
+
+## Functional testing
+
+End-to-end check — upload an image, wait for the DynamoDB row + result JSON, tail
+the logs, and verify the email subscription:
+
+```bash
+./scripts/smoke-test.sh                       # uses test/sample-image.jpg
+./scripts/smoke-test.sh path/to/your.jpg
+```
+
+`PASS` means S3 → Lambda → DynamoDB → results JSON all worked. The script warns
+loudly if the SNS subscription is still `PendingConfirmation` (the usual reason
+no email arrives). Manual equivalent:
 
 ```bash
 BUCKET=$(terraform -chdir=terraform output -raw input_bucket)
 aws s3 cp test/sample-image.jpg s3://$BUCKET/uploads/sample-image.jpg
-# watch it run:
 aws logs tail /aws/lambda/cloudsight-intake-processor --follow
+aws dynamodb scan --table-name "$(terraform -chdir=terraform output -raw dynamodb_table)" \
+  --query 'Items[].{id:image_id.S,status:status.S,summary:summary.S}' --output table
 ```
 
-> For a quick throwaway run without remote state, delete `terraform/backend.tf`
-> and run `terraform init` with local state.
+## Troubleshooting
+
+**No email when an image is processed** — in order of likelihood:
+
+1. **Subscription not confirmed.** `aws_sns_topic_subscription` starts as
+   `PendingConfirmation`; AWS emails an *"AWS Notification - Subscription
+   Confirmation"* link that must be clicked before *any* message is delivered.
+   Check:
+   ```bash
+   aws sns list-subscriptions-by-topic \
+     --topic-arn "$(terraform -chdir=terraform output -raw sns_topic_arn)" \
+     --query 'Subscriptions[].{Endpoint:Endpoint,Arn:SubscriptionArn}'
+   ```
+   If the ARN is literally `PendingConfirmation`, re-send it:
+   ```bash
+   aws sns subscribe --topic-arn "$(terraform -chdir=terraform output -raw sns_topic_arn)" \
+     --protocol email --notification-endpoint you@example.com
+   ```
+   then click the link. Check spam/promotions too.
+2. **The pipeline never ran.** If `terraform apply` hasn't succeeded, the input
+   bucket doesn't exist and uploads go nowhere. Run the functional test — a
+   `FAIL` with no DynamoDB row points here. Check
+   `aws logs tail /aws/lambda/cloudsight-intake-processor --since 15m`.
+3. **Lambda error before publish.** The handler still tries to send a *failure*
+   email and then re-raises to the DLQ. Check the DLQ:
+   `aws sqs get-queue-attributes --queue-url "$(terraform -chdir=terraform output -raw dlq_url)" --attribute-names ApproximateNumberOfMessagesVisible`.
+4. **Wrong email in `sns_email`.** Fix `terraform.tfvars` (or the `SNS_EMAIL`
+   secret), re-apply, confirm the new subscription.
+
+**Streamlit `NoSuchBucket` / `InvalidAccessKeyId`** — the app's Secrets point at
+buckets that don't exist yet, or the IAM keys are wrong/for another account.
+Deploy the backend first, then paste the exact names from the Actions run Summary
+(or `terraform output`) into the Streamlit Secrets panel and reboot the app.
+
+**`terraform init` → "The value cannot be empty or all whitespace"** — the
+`TF_STATE_BUCKET` (or `AWS_REGION`) secret is unset, so `-backend-config="bucket="`
+was passed empty. Set the secret.
 
 ## Run the Streamlit app locally
 
