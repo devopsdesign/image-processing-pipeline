@@ -20,7 +20,6 @@ env:
   TF_VERSION: "1.10.5"
   PYTHON_VERSION: "3.11"
   AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'us-east-1' }}
-  NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL || 'devopsdesign@protonmail.com' }}
 
 jobs:
   destroy:
@@ -62,6 +61,21 @@ jobs:
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="region=${AWS_REGION}"
 
+      - name: Notify teardown starting (SNS)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          TOPIC=$(terraform -chdir=terraform output -raw sns_topic_arn 2>/dev/null || true)
+          if [ -n "$TOPIC" ]; then
+            aws sns publish --topic-arn "$TOPIC" \
+              --subject "[CloudSight] Teardown starting (run #${{ github.run_number }})" \
+              --message "CloudSight Intake teardown triggered by @${{ github.actor }}.
+          The SNS topic itself is deleted in this run, so this is the last notification.
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            echo "::warning::No SNS topic found - nothing deployed?"
+          fi
+
       - name: Empty S3 buckets
         working-directory: terraform
         run: |
@@ -80,25 +94,9 @@ jobs:
           TF_VAR_aws_region: ${{ env.AWS_REGION }}
         run: terraform destroy -auto-approve -input=false
 
-      - name: Email the result
+      - name: Teardown summary
         if: ${{ always() }}
-        continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT || 465 }}
-          secure: ${{ secrets.SMTP_SECURE || 'true' }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          from: CloudSight CI <${{ secrets.SMTP_FROM || secrets.SMTP_USERNAME }}>
-          to: ${{ env.NOTIFY_EMAIL }}
-          subject: "[CloudSight] Destroy ${{ job.status }} - run #${{ github.run_number }}"
-          body: |
-            CloudSight Intake - teardown ${{ job.status }}
-
-            Repo    : ${{ github.repository }}
-            Region  : ${{ env.AWS_REGION }}
-            Trigger : @${{ github.actor }} (manual)
-            Run log : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            All pipeline resources destroyed. The Terraform state bucket was kept.
+        run: |
+          echo "## Teardown ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "All pipeline resources destroyed (SNS topic included). The Terraform state bucket was kept." >> "$GITHUB_STEP_SUMMARY"

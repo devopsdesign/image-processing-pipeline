@@ -24,7 +24,6 @@ env:
   TF_VERSION: "1.10.5"
   PYTHON_VERSION: "3.11"
   AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'us-east-1' }}
-  NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL || 'devopsdesign@protonmail.com' }}
 
 jobs:
   deploy:
@@ -53,7 +52,7 @@ jobs:
             eval "val=\${$v}"
             [ -n "$val" ] || { echo "::error::Missing repository secret $v"; miss=1; }
           done
-          echo "Region: $AWS_REGION | Notify: $NOTIFY_EMAIL"
+          echo "Region: $AWS_REGION"
           [ "$miss" -eq 0 ] || { echo "::error::Add the missing secrets under Settings -> Secrets and variables -> Actions"; exit 1; }
 
       - name: Lint & unit tests
@@ -166,27 +165,29 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------------- email notification ----------------
-      - name: Email the result
+      # ---------------- notification (same SNS topic the Lambda uses) ----------------
+      - name: Notify via SNS
         if: ${{ always() }}
         continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT || 465 }}
-          secure: ${{ secrets.SMTP_SECURE || 'true' }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          from: CloudSight CI <${{ secrets.SMTP_FROM || secrets.SMTP_USERNAME }}>
-          to: ${{ env.NOTIFY_EMAIL }}
-          subject: "[CloudSight] Deploy ${{ job.status }} - run #${{ github.run_number }}"
-          body: |
-            CloudSight Intake - deployment ${{ job.status }}
+        run: |
+          set -uo pipefail
+          TOPIC=$(terraform -chdir=terraform output -raw sns_topic_arn 2>/dev/null || true)
+          if [ -z "$TOPIC" ]; then
+            ACCT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
+            [ -n "$ACCT" ] && TOPIC="arn:aws:sns:${AWS_REGION}:${ACCT}:cloudsight-intake-notifications"
+          fi
+          if [ -z "$TOPIC" ]; then
+            echo "::warning::No SNS topic ARN available - skipping notification"
+            exit 0
+          fi
+          aws sns publish --topic-arn "$TOPIC" \
+            --subject "[CloudSight] Deploy ${{ job.status }} (run #${{ github.run_number }})" \
+            --message "CloudSight Intake deploy: ${{ job.status }}
+          Repo   : ${{ github.repository }}
+          Region : ${AWS_REGION}
+          By     : @${{ github.actor }} (manual)
+          Run    : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            Repo    : ${{ github.repository }}
-            Region  : ${{ env.AWS_REGION }}
-            Trigger : @${{ github.actor }} (manual)
-            Run log : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            ----- image-processing test output -----
-            ${{ steps.smoke.outputs.summary || 'Test skipped, or the pipeline failed before the test step.' }}
+          Image-processing test:
+          ${{ steps.smoke.outputs.summary || 'skipped or not reached' }}" \
+            || echo "::warning::SNS publish failed (topic may not exist yet)"
