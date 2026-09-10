@@ -1,61 +1,34 @@
-name: CI / Deploy
+name: Deploy
 
+# Manual only. Lint + unit tests -> provision with Terraform -> run a real
+# image through the pipeline with a freshly generated random image -> email the
+# result to the maintainer.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      run_test:
+        description: Run the post-deploy image-processing test
+        type: boolean
+        default: true
+      use_rekognition:
+        description: Enable Amazon Rekognition (12-month free tier; off = always-free)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency: cloudsight-lifecycle
+
 env:
   TF_VERSION: "1.10.5"
   PYTHON_VERSION: "3.11"
-  # Region is not a secret. Set repo Variable OR Secret AWS_REGION to override.
   AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'us-east-1' }}
+  NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL || 'devopsdesign@protonmail.com' }}
 
 jobs:
-  test:
-    name: Lint & test
-    runs-on: ubuntu-latest
-    env:
-      AWS_XRAY_SDK_ENABLED: "false"
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r lambda/requirements.txt -r requirements-dev.txt
-
-      - name: Ruff
-        run: ruff check lambda tests app
-
-      - name: Pytest
-        run: pytest
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Terraform fmt / validate
-        working-directory: terraform
-        run: |
-          terraform fmt -check -recursive
-          terraform init -backend=false -input=false
-          terraform validate
-
   deploy:
-    name: Terraform apply
-    needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    concurrency: deploy-cloudsight
     steps:
       - uses: actions/checkout@v4
 
@@ -67,21 +40,30 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Preflight - required config
+      - name: Preflight - required secrets
         env:
-          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
-          SNS_EMAIL: ${{ secrets.SNS_EMAIL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          SNS_EMAIL: ${{ secrets.SNS_EMAIL }}
         run: |
           set -e
           miss=0
-          [ -n "$AWS_ACCESS_KEY_ID" ]     || { echo "::error::Missing secret AWS_ACCESS_KEY_ID"; miss=1; }
-          [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "::error::Missing secret AWS_SECRET_ACCESS_KEY"; miss=1; }
-          [ -n "$TF_STATE_BUCKET" ]       || { echo "::error::Missing secret TF_STATE_BUCKET (e.g. cloudsight-tfstate-<ACCOUNT_ID>)"; miss=1; }
-          [ -n "$SNS_EMAIL" ]             || { echo "::error::Missing secret SNS_EMAIL"; miss=1; }
-          echo "Region: $AWS_REGION"
-          [ "$miss" -eq 0 ] || { echo "::error::Set the missing repository secrets under Settings -> Secrets and variables -> Actions"; exit 1; }
+          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TF_STATE_BUCKET SNS_EMAIL; do
+            eval "val=\${$v}"
+            [ -n "$val" ] || { echo "::error::Missing repository secret $v"; miss=1; }
+          done
+          echo "Region: $AWS_REGION | Notify: $NOTIFY_EMAIL"
+          [ "$miss" -eq 0 ] || { echo "::error::Add the missing secrets under Settings -> Secrets and variables -> Actions"; exit 1; }
+
+      - name: Lint & unit tests
+        env:
+          AWS_XRAY_SDK_ENABLED: "false"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r lambda/requirements.txt -r requirements-dev.txt
+          ruff check lambda tests app
+          pytest -q
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -96,7 +78,7 @@ jobs:
         run: |
           set -euo pipefail
           if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
-            echo "State bucket already exists: $BUCKET"
+            echo "State bucket exists: $BUCKET"
           else
             echo "Creating state bucket $BUCKET in $AWS_REGION"
             if [ "$AWS_REGION" = "us-east-1" ]; then
@@ -115,7 +97,7 @@ jobs:
       - name: Build Lambda package
         run: bash scripts/build_lambda.sh
 
-      - name: Terraform init (S3 backend)
+      - name: Terraform init
         working-directory: terraform
         run: |
           terraform init -input=false -reconfigure \
@@ -127,24 +109,84 @@ jobs:
         env:
           TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
           TF_VAR_aws_region: ${{ env.AWS_REGION }}
-          TF_VAR_use_rekognition: ${{ vars.USE_REKOGNITION || 'false' }}
+          TF_VAR_use_rekognition: ${{ inputs.use_rekognition }}
         run: terraform apply -auto-approve -input=false
 
-      - name: Publish outputs to run summary
+      - name: Deployment outputs
         working-directory: terraform
         run: |
-          IN=$(terraform output -raw input_bucket)
-          OUT=$(terraform output -raw output_bucket)
-          TBL=$(terraform output -raw dynamodb_table)
           {
             echo "## CloudSight Intake deployed"
             echo ""
-            echo "Paste these into the Streamlit app's **Secrets** panel:"
-            echo ""
+            echo "Streamlit Secrets:"
             echo '```toml'
-            echo "AWS_REGION     = \"${AWS_REGION}\""
-            echo "INPUT_BUCKET   = \"${IN}\""
-            echo "OUTPUT_BUCKET  = \"${OUT}\""
-            echo "DYNAMODB_TABLE = \"${TBL}\""
+            echo "AWS_REGION     = \"$AWS_REGION\""
+            echo "INPUT_BUCKET   = \"$(terraform output -raw input_bucket)\""
+            echo "OUTPUT_BUCKET  = \"$(terraform output -raw output_bucket)\""
+            echo "DYNAMODB_TABLE = \"$(terraform output -raw dynamodb_table)\""
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------- post-deploy image-processing test ----------------
+      - name: Generate a random test image
+        if: ${{ inputs.run_test }}
+        run: |
+          python -m pip install --quiet pillow
+          python - <<'PY'
+          import os, random
+          from PIL import Image
+          w, h = 480, 320
+          img = Image.new("RGB", (w, h))
+          img.putdata([(random.randrange(256), random.randrange(256), random.randrange(256)) for _ in range(w * h)])
+          path = "/tmp/cloudsight-test.jpg"
+          img.save(path, "JPEG", quality=85)
+          print("wrote", path, os.path.getsize(path), "bytes")
+          PY
+
+      - name: Run image-processing test
+        id: smoke
+        if: ${{ inputs.run_test }}
+        run: |
+          set -o pipefail
+          chmod +x scripts/smoke-test.sh
+          ./scripts/smoke-test.sh /tmp/cloudsight-test.jpg | tee /tmp/smoke.log
+          {
+            echo "summary<<SMOKE_EOF"
+            tail -n 40 /tmp/smoke.log
+            echo "SMOKE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Test result to job summary
+        if: ${{ always() && inputs.run_test }}
+        run: |
+          {
+            echo "## Image-processing test"
+            echo '```'
+            cat /tmp/smoke.log 2>/dev/null || echo "(test did not run)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------- email notification ----------------
+      - name: Email the result
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT || 465 }}
+          secure: ${{ secrets.SMTP_SECURE || 'true' }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: CloudSight CI <${{ secrets.SMTP_FROM || secrets.SMTP_USERNAME }}>
+          to: ${{ env.NOTIFY_EMAIL }}
+          subject: "[CloudSight] Deploy ${{ job.status }} - run #${{ github.run_number }}"
+          body: |
+            CloudSight Intake - deployment ${{ job.status }}
+
+            Repo    : ${{ github.repository }}
+            Region  : ${{ env.AWS_REGION }}
+            Trigger : @${{ github.actor }} (manual)
+            Run log : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ----- image-processing test output -----
+            ${{ steps.smoke.outputs.summary || 'Test skipped, or the pipeline failed before the test step.' }}

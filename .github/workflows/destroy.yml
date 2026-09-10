@@ -1,36 +1,47 @@
 name: Destroy
 
+# Manual only. Tears down every AWS resource this project creates, for cost
+# management. The Terraform state bucket is intentionally left in place (it costs
+# ~nothing and is needed to redeploy); delete it by hand if you really want to.
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type "destroy" to confirm teardown'
+        description: Type "destroy" to permanently delete all CloudSight AWS resources
         required: true
-        default: "no"
+        default: ""
 
 permissions:
   contents: read
 
+concurrency: cloudsight-lifecycle
+
 env:
+  TF_VERSION: "1.10.5"
+  PYTHON_VERSION: "3.11"
   AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'us-east-1' }}
+  NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL || 'devopsdesign@protonmail.com' }}
 
 jobs:
   destroy:
     runs-on: ubuntu-latest
-    concurrency: deploy-cloudsight
     steps:
       - uses: actions/checkout@v4
 
       - name: Check confirmation
         run: |
-          if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
-            echo "Confirmation not given. Aborting."
+          if [ "${{ inputs.confirm }}" != "destroy" ]; then
+            echo "::error::Input was '${{ inputs.confirm }}', expected exactly 'destroy'. Aborting."
             exit 1
           fi
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.10.5"
+          terraform_version: ${{ env.TF_VERSION }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -39,7 +50,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform init (S3 backend)
+      - name: Build Lambda package
+        # data.archive_file / null_resource reference terraform/build/, which
+        # Terraform still evaluates during `destroy`.
+        run: bash scripts/build_lambda.sh
+
+      - name: Terraform init
         working-directory: terraform
         run: |
           terraform init -input=false -reconfigure \
@@ -49,14 +65,40 @@ jobs:
       - name: Empty S3 buckets
         working-directory: terraform
         run: |
-          for out in input_bucket output_bucket; do
-            name=$(terraform output -raw "$out" 2>/dev/null || true)
-            [ -n "$name" ] && aws s3 rm "s3://$name" --recursive || true
+          for o in input_bucket output_bucket; do
+            b=$(terraform output -raw "$o" 2>/dev/null || true)
+            if [ -n "$b" ]; then
+              echo "Emptying s3://$b"
+              aws s3 rm "s3://$b" --recursive || true
+            fi
           done
 
       - name: Terraform destroy
         working-directory: terraform
         env:
           TF_VAR_sns_email: ${{ secrets.SNS_EMAIL }}
-          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
         run: terraform destroy -auto-approve -input=false
+
+      - name: Email the result
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT || 465 }}
+          secure: ${{ secrets.SMTP_SECURE || 'true' }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: CloudSight CI <${{ secrets.SMTP_FROM || secrets.SMTP_USERNAME }}>
+          to: ${{ env.NOTIFY_EMAIL }}
+          subject: "[CloudSight] Destroy ${{ job.status }} - run #${{ github.run_number }}"
+          body: |
+            CloudSight Intake - teardown ${{ job.status }}
+
+            Repo    : ${{ github.repository }}
+            Region  : ${{ env.AWS_REGION }}
+            Trigger : @${{ github.actor }} (manual)
+            Run log : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            All pipeline resources destroyed. The Terraform state bucket was kept.
