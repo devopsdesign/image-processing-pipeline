@@ -169,8 +169,15 @@ jobs:
       - name: Notify via SNS
         if: ${{ always() }}
         continue-on-error: true
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RUN_NUMBER: ${{ github.run_number }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SMOKE_SUMMARY: ${{ steps.smoke.outputs.summary }}
         run: |
-          set -uo pipefail
+          set -o pipefail
           TOPIC=$(terraform -chdir=terraform output -raw sns_topic_arn 2>/dev/null || true)
           if [ -z "$TOPIC" ]; then
             ACCT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
@@ -180,14 +187,16 @@ jobs:
             echo "::warning::No SNS topic ARN available - skipping notification"
             exit 0
           fi
+          {
+            printf 'CloudSight Intake deploy: %s\n\n' "$JOB_STATUS"
+            printf 'Repo   : %s\n' "$REPO"
+            printf 'Region : %s\n' "$AWS_REGION"
+            printf 'By     : @%s (manual)\n' "$ACTOR"
+            printf 'Run    : %s\n\n' "$RUN_URL"
+            printf 'Image-processing test:\n%s\n' "${SMOKE_SUMMARY:-skipped or not reached}"
+          } > /tmp/sns-msg.txt
           aws sns publish --topic-arn "$TOPIC" \
-            --subject "[CloudSight] Deploy ${{ job.status }} (run #${{ github.run_number }})" \
-            --message "CloudSight Intake deploy: ${{ job.status }}
-          Repo   : ${{ github.repository }}
-          Region : ${AWS_REGION}
-          By     : @${{ github.actor }} (manual)
-          Run    : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          Image-processing test:
-          ${{ steps.smoke.outputs.summary || 'skipped or not reached' }}" \
-            || echo "::warning::SNS publish failed (topic may not exist yet)"
+            --subject "[CloudSight] Deploy ${JOB_STATUS} (run #${RUN_NUMBER})" \
+            --message file:///tmp/sns-msg.txt \
+            && echo "Published deploy status to $TOPIC" \
+            || echo "::warning::SNS publish failed"

@@ -63,18 +63,25 @@ jobs:
 
       - name: Notify teardown starting (SNS)
         continue-on-error: true
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -uo pipefail
+          set -o pipefail
           TOPIC=$(terraform -chdir=terraform output -raw sns_topic_arn 2>/dev/null || true)
-          if [ -n "$TOPIC" ]; then
-            aws sns publish --topic-arn "$TOPIC" \
-              --subject "[CloudSight] Teardown starting (run #${{ github.run_number }})" \
-              --message "CloudSight Intake teardown triggered by @${{ github.actor }}.
-          The SNS topic itself is deleted in this run, so this is the last notification.
-          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          else
+          if [ -z "$TOPIC" ]; then
             echo "::warning::No SNS topic found - nothing deployed?"
+            exit 0
           fi
+          {
+            printf 'CloudSight Intake teardown triggered by @%s.\n' "$ACTOR"
+            printf 'The SNS topic itself is deleted in this run, so this is the last notification.\n'
+            printf 'Run: %s\n' "$RUN_URL"
+          } > /tmp/sns-msg.txt
+          aws sns publish --topic-arn "$TOPIC" \
+            --subject "[CloudSight] Teardown starting (run #${RUN_NUMBER})" \
+            --message file:///tmp/sns-msg.txt
 
       - name: Empty S3 buckets
         working-directory: terraform
