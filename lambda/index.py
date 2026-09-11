@@ -4,7 +4,9 @@ S3 ObjectCreated (uploads/*.jpg|jpeg|png|gif)
   -> ETag-based idempotency check against DynamoDB
   -> optional cascading Amazon Rekognition (labels -> text -> faces)
   -> summary row in DynamoDB + full JSON in the output bucket
-  -> SNS success / failure notification
+  -> notify: SNS plain-text always (guaranteed delivery) + SES HTML with the
+     image embedded inline, best-effort on top (can be spam-filtered by
+     strict-DMARC recipient domains even when SES itself reports success)
 
 Failures are re-raised so the async invocation lands in the SQS DLQ.
 """
@@ -117,9 +119,14 @@ def _process_record(record):
             + (f"\nFull-size image (SigV4 link, ~1h):\n{preview_url}\n" if preview_url else "")
         )
 
-        # Rich HTML email with the image embedded inline; SNS plain-text is the fallback.
-        if not _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summary, result_key):
-            _publish(subject=subject, message=plain_body)
+        # SNS plain-text always goes out - it's the guaranteed-delivery channel
+        # (it isn't sent "from" a third-party-controlled address, so strict-DMARC
+        # domains like protonmail.com can't silently spam-filter it the way they
+        # can an SES email claiming to be From: you@protonmail.com). The SES HTML
+        # copy with the image embedded inline is a best-effort bonus on top.
+        _publish(subject=subject, message=plain_body, best_effort=True)
+        rich_sent = _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summary, result_key)
+        logger.info("Notifications sent: sns=True ses=%s", rich_sent)
 
         return {"key": key, "image_id": image_id, "status": "processed", "summary": summary}
 
