@@ -253,9 +253,9 @@ resource "aws_lambda_function" "processor" {
     mode = "Active"
   }
 
-  dead_letter_config {
-    target_arn = aws_sqs_queue.dlq.arn
-  }
+  # No dead_letter_config here - retry/DLQ is now owned by the Step Functions
+  # state machine below (Retry + Catch), since Step Functions invokes this
+  # Lambda synchronously rather than S3 invoking it asynchronously.
 
   environment {
     variables = {
@@ -277,35 +277,199 @@ resource "aws_lambda_function" "processor" {
   ]
 }
 
-resource "aws_lambda_function_event_invoke_config" "processor" {
-  function_name                = aws_lambda_function.processor.function_name
-  maximum_retry_attempts       = 2
-  maximum_event_age_in_seconds = 3600
-}
-
-resource "aws_lambda_permission" "s3" {
-  statement_id   = "AllowS3Invoke"
-  action         = "lambda:InvokeFunction"
-  function_name  = aws_lambda_function.processor.function_name
-  principal      = "s3.amazonaws.com"
-  source_arn     = aws_s3_bucket.input.arn
-  source_account = local.account_id
-}
-
+# ---------------------------------------------------------------------------
+# Event trigger: S3 -> EventBridge -> Step Functions -> Lambda.
+#
+# Decouples the trigger from the processor (events are archivable/replayable
+# on the bus) and moves retry/DLQ from Lambda's built-in async config to an
+# explicit, visualisable state machine. The Lambda itself is unchanged - it
+# still receives the same {"Records": [...]} shape it always has, built by
+# the Pass state below.
+# ---------------------------------------------------------------------------
 resource "aws_s3_bucket_notification" "input" {
-  bucket = aws_s3_bucket.input.id
+  bucket      = aws_s3_bucket.input.id
+  eventbridge = true
+}
 
-  dynamic "lambda_function" {
-    for_each = toset(local.image_types)
-    content {
-      lambda_function_arn = aws_lambda_function.processor.arn
-      events              = ["s3:ObjectCreated:*"]
-      filter_prefix       = "uploads/"
-      filter_suffix       = lambda_function.value
+resource "aws_cloudwatch_event_rule" "image_uploaded" {
+  name        = "${local.name}-image-uploaded"
+  description = "New object under uploads/ in the input bucket"
+
+  event_pattern = jsonencode({
+    source      = ["aws.s3"]
+    detail-type = ["Object Created"]
+    detail = {
+      bucket = { name = [aws_s3_bucket.input.id] }
+      object = { key = [{ prefix = "uploads/" }] }
+    }
+  })
+
+  tags = local.tags
+}
+
+data "aws_iam_policy_document" "eventbridge_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
     }
   }
+}
 
-  depends_on = [aws_lambda_permission.s3]
+resource "aws_iam_role" "eventbridge" {
+  name               = "${local.name}-eventbridge-role"
+  assume_role_policy = data.aws_iam_policy_document.eventbridge_assume.json
+  tags               = local.tags
+}
+
+resource "aws_iam_role_policy" "eventbridge_start_execution" {
+  name = "${local.name}-eventbridge-start-execution"
+  role = aws_iam_role.eventbridge.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "states:StartExecution"
+      Resource = aws_sfn_state_machine.processor.arn
+    }]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "processor" {
+  rule     = aws_cloudwatch_event_rule.image_uploaded.name
+  arn      = aws_sfn_state_machine.processor.arn
+  role_arn = aws_iam_role.eventbridge.arn
+}
+
+# ---------------------------------------------------------------------------
+# Step Functions - one Task invoking the existing Lambda, with Retry (mirrors
+# the previous 2-attempt async policy) and a Catch that forwards to the same
+# SQS DLQ on final failure.
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "sfn_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["states.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "sfn" {
+  name               = "${local.name}-sfn-role"
+  assume_role_policy = data.aws_iam_policy_document.sfn_assume.json
+  tags               = local.tags
+}
+
+data "aws_iam_policy_document" "sfn" {
+  statement {
+    sid       = "InvokeProcessor"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.processor.arn]
+  }
+
+  statement {
+    sid       = "SendToDeadLetterQueue"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.dlq.arn]
+  }
+
+  statement {
+    sid = "ExecutionLogging"
+    actions = [
+      "logs:CreateLogDelivery",
+      "logs:GetLogDelivery",
+      "logs:UpdateLogDelivery",
+      "logs:DeleteLogDelivery",
+      "logs:ListLogDeliveries",
+      "logs:PutResourcePolicy",
+      "logs:DescribeResourcePolicies",
+      "logs:DescribeLogGroups",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "sfn" {
+  name   = "${local.name}-sfn-policy"
+  role   = aws_iam_role.sfn.id
+  policy = data.aws_iam_policy_document.sfn.json
+}
+
+resource "aws_cloudwatch_log_group" "sfn" {
+  name              = "/aws/states/${local.name}-processor"
+  retention_in_days = var.log_retention_days
+  tags              = local.tags
+}
+
+resource "aws_sfn_state_machine" "processor" {
+  name     = "${local.name}-processor"
+  role_arn = aws_iam_role.sfn.arn
+  type     = "STANDARD"
+
+  logging_configuration {
+    log_destination        = "${aws_cloudwatch_log_group.sfn.arn}:*"
+    include_execution_data = true
+    level                  = "ERROR"
+  }
+
+  definition = jsonencode({
+    Comment = "CloudSight Intake - process one S3 upload, retry, DLQ on final failure"
+    StartAt = "BuildS3Event"
+    States = {
+      BuildS3Event = {
+        Type = "Pass"
+        Parameters = {
+          Records = [{
+            s3 = {
+              bucket = { "name.$" = "$.detail.bucket.name" }
+              object = {
+                "key.$"  = "$.detail.object.key"
+                "eTag.$" = "$.detail.object.etag"
+              }
+            }
+          }]
+        }
+        Next = "ProcessImage"
+      }
+      ProcessImage = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.processor.arn
+          "Payload.$"  = "$"
+        }
+        ResultSelector = { "result.$" = "$.Payload" }
+        TimeoutSeconds = 30
+        Retry = [{
+          ErrorEquals     = ["States.ALL"]
+          IntervalSeconds = 60
+          MaxAttempts     = 2
+          BackoffRate     = 2.0
+        }]
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "SendToDLQ"
+        }]
+        End = true
+      }
+      SendToDLQ = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sqs:sendMessage"
+        Parameters = {
+          QueueUrl        = aws_sqs_queue.dlq.id
+          "MessageBody.$" = "$"
+        }
+        End = true
+      }
+    }
+  })
+
+  tags = local.tags
 }
 
 # ---------------------------------------------------------------------------
@@ -482,12 +646,29 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title  = "DLQ backlog (failed async invocations)"
+          title  = "DLQ backlog (final-failure messages)"
           region = var.aws_region
           view   = "timeSeries"
           period = 300
           metrics = [
             ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", aws_sqs_queue.dlq.name, { stat = "Maximum" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 12
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Step Functions executions"
+          region = var.aws_region
+          view   = "timeSeries"
+          period = 300
+          metrics = [
+            ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", aws_sfn_state_machine.processor.arn, { stat = "Sum" }],
+            ["AWS/States", "ExecutionsFailed", "StateMachineArn", aws_sfn_state_machine.processor.arn, { stat = "Sum" }],
           ]
         }
       },

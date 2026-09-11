@@ -72,3 +72,13 @@ output "budget_name" {
   description = "AWS Budgets monthly cost alert (80% actual / 100% forecasted -> email)."
   value       = aws_budgets_budget.monthly_cost.name
 }
+
+output "state_machine_arn" {
+  description = "Step Functions state machine that orchestrates each upload (visual execution graph in the console)."
+  value       = aws_sfn_state_machine.processor.arn
+}
+
+output "state_machine_console_url" {
+  description = "Direct link to the state machine's execution list."
+  value       = "https://${var.aws_region}.console.aws.amazon.com/states/home?region=${var.aws_region}#/statemachines/view/${aws_sfn_state_machine.processor.arn}"
+}

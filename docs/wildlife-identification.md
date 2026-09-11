@@ -175,6 +175,8 @@ audit the call.
 sequenceDiagram
     participant UI as Streamlit UI
     participant S3in as S3 input bucket
+    participant EB as EventBridge
+    participant SFN as Step Functions
     participant L as Lambda processor
     participant Rek as Amazon Rekognition
     participant DDB as DynamoDB
@@ -183,12 +185,14 @@ sequenceDiagram
 
     UI->>UI: md5(bytes) -> image_id
     UI->>S3in: PutObject uploads/<name> (SigV4, private)
-    S3in-->>L: ObjectCreated event (suffix .jpg/.jpeg/.png/.gif)
+    S3in-->>EB: Object Created event
+    EB->>SFN: StartExecution (rule: uploads/*)
+    SFN->>L: Task: lambda:invoke (Retry x2, Catch -> DLQ)
     L->>DDB: Query image_id  (idempotency check)
     alt already processed
         L-->>L: return skipped(duplicate)
     else new image
-        L->>Rek: DetectLabels (MaxLabels 5, MinConfidence 75)
+        L->>Rek: DetectLabels (MaxLabels 10, MinConfidence 50)
         opt labels found
             L->>Rek: DetectText
         end
@@ -197,7 +201,7 @@ sequenceDiagram
         end
         L->>DDB: PutItem (summary row)
         L->>S3out: PutObject results/<image_id>.json (full result)
-        L->>Mail: HTML email w/ inline image + label table (SES),\n fallback plain-text (SNS)
+        L->>Mail: SNS plain-text (always) + SES HTML w/ inline image (best-effort)
     end
     loop every 3 s, up to 90 s
         UI->>DDB: Query image_id
@@ -217,20 +221,27 @@ sequenceDiagram
    Block-Public-Access on and SSE-S3 (AES256); the request is authenticated
    SigV4 with the scoped uploader key.
 
-3. **Event trigger.** S3 emits an `s3:ObjectCreated:*` event, filtered to the
-   `uploads/` prefix and `.jpg/.jpeg/.png/.gif` suffixes, which asynchronously
-   invokes **`cloudsight-intake-processor`** (Python 3.11, 128 MB, 15 s timeout,
-   X-Ray active). Async invocation config: 2 retries, then the
-   **`cloudsight-intake-dlq`** SQS dead-letter queue (a CloudWatch alarm fires if
-   anything lands there).
+3. **Event trigger.** The bucket forwards every `Object Created` event to the
+   account's **EventBridge** bus. A rule filtered to the `uploads/` prefix
+   starts a **Step Functions** execution, which builds the event shape the
+   Lambda expects and invokes **`cloudsight-intake-processor`** (Python 3.11,
+   128 MB, 15 s timeout, X-Ray active) as a `Task` with **`Retry`** (2 attempts,
+   exponential backoff) and a **`Catch`** that forwards to the
+   **`cloudsight-intake-dlq`** SQS queue on final failure (a CloudWatch alarm
+   fires if anything lands there). This decouples the trigger from the
+   processor — events sit on the bus rather than calling the Lambda directly —
+   and gives each upload a visual execution graph in the Step Functions console.
 
 4. **Idempotency.** The Lambda `Query`s DynamoDB for `image_id`. If a row exists,
    it returns `skipped / duplicate` — re-uploading the same photo never
    double-processes or double-emails.
 
 5. **Identification (cascading, to conserve calls).**
-   - **`DetectLabels`** — `MaxLabels=5`, `MinConfidence=75`. Returns the animal
-     category and scene/attribute labels with confidence.
+   - **`DetectLabels`** — `MaxLabels=10`, `MinConfidence=50` (tunable via the
+     `rekognition_min_confidence` Terraform variable / `REKOGNITION_MIN_CONFIDENCE`
+     env var). Lower than Rekognition's typical default so a busy or ambiguous
+     photo still surfaces its best (weaker) guesses with their score, instead of
+     an empty result — see [Handling unclear results](#handling-unclear-results).
    - **`DetectText`** — only if labels came back. Reads collars, ear tags, band
      numbers, trail-cam stamps, signage.
    - **`DetectFaces`** — only if labels or text came back. Near-always empty for
@@ -293,21 +304,40 @@ sequenceDiagram
 | Unsupported file type | `skipped / unsupported_type`, no charge |
 | Rekognition call errors | logged, that sub-result is empty, `analysis_mode` degrades to `rekognition-fallback` / `partial_error`; the row and JSON are still written |
 | SES not verified / oversize | automatic fallback to SNS plain-text email |
-| Any unhandled exception | error email sent, exception re-raised → 2 retries → SQS DLQ + CloudWatch alarm |
+| Any unhandled exception | error email sent, exception re-raised → Step Functions `Retry` (2 attempts) → `Catch` → SQS DLQ + CloudWatch alarm |
 | UI poll timeout (90 s) | UI shows "still processing" with a CloudWatch Logs hint; the pipeline continues regardless |
+
+Both the Rekognition-error path and the DLQ path have been deliberately triggered
+and verified against the live stack, not just configured on paper.
+
+### Querying past results
+
+Every result is also queryable after the fact, without touching the Lambda:
+a **read-only HTTP API** (`GET /images`, `GET /images/{image_id}`) and **Athena
+SQL** over the same `results/*.json` files. See the root
+[README](../README.md#querying-results-after-the-fact) for endpoints and example
+queries.
 
 ### Observability
 
 - **CloudWatch dashboard** `cloudsight-intake-dashboard` — Lambda invocations /
-  errors / duration (avg + p99), DynamoDB consumed capacity, DLQ backlog.
+  errors / duration (avg + p99), DynamoDB consumed capacity, Step Functions
+  executions succeeded/failed, DLQ backlog.
+- **Step Functions console** — a visual execution graph per upload: which state
+  it was in, how long each took, and the exact Retry/Catch path taken on failure.
 - **X-Ray** — per-upload trace with sub-segments for S3, DynamoDB, SNS/SES and
   each Rekognition call; service map shows latency and error rate per hop.
-- **Logs** — `/aws/lambda/cloudsight-intake-processor`, 7-day retention.
+- **Logs** — `/aws/lambda/cloudsight-intake-processor` and
+  `/aws/states/cloudsight-intake-processor`, 7-day retention.
 
 ### Cost posture
 
-Always-free: Lambda, DynamoDB on-demand, SNS, SQS, CloudWatch (1 dashboard / 1
-alarm), X-Ray, presigned URLs. 12-month free tier: S3 storage (tiny), Amazon
-Rekognition (5,000 images/month), SES (send). Beyond the window, Rekognition is
-~$1 per 1,000 images and SES ~$0.10 per 1,000 emails. Run the **Destroy**
-workflow to return to $0.
+Always-free: Lambda, DynamoDB on-demand, SNS, SQS, Step Functions (Standard,
+4,000 free state transitions/month), EventBridge default bus, CloudWatch (2
+dashboard widgets' worth of alarms), X-Ray, presigned URLs, AWS Budgets.
+12-month free tier: S3 storage (tiny), Amazon Rekognition (5,000 images/month),
+SES (send), API Gateway HTTP API. Beyond those windows: Rekognition ~$1/1,000
+images, SES ~$0.10/1,000 emails, API Gateway ~$1/million requests. Athena is
+capped at 1 GB scanned per query (~$0.005 worst case). A monthly **AWS Budget**
+emails you at 80% actual / 100% forecasted spend either way. Run the
+**Destroy** workflow to return to $0.

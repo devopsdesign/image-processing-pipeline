@@ -3,10 +3,13 @@
 A production-shaped, fully serverless image-processing pipeline on AWS that stays
 inside the **AWS Always-Free tier** in its default configuration.
 
-Upload an image → S3 event → Lambda (X-Ray traced) → optional cascading Amazon
-Rekognition → summary in DynamoDB + full JSON in S3 → SES/SNS notification. Failed
-async invocations land in an SQS dead-letter queue with a CloudWatch alarm, and a
-CloudWatch dashboard tracks the whole thing.
+Upload an image → S3 event → EventBridge → Step Functions → Lambda (X-Ray
+traced) → optional cascading Amazon Rekognition → summary in DynamoDB + full
+JSON in S3 → SES/SNS notification, plus a read-only HTTP API and Athena SQL
+over the results. Failures retry and then land in an SQS dead-letter queue via
+the state machine's Catch, with a CloudWatch alarm, and a CloudWatch dashboard
+tracks the whole thing. A monthly AWS Budget emails you if it ever stops being
+free.
 
 **Using it for wildlife / animal identification?** See
 [`docs/wildlife-identification.md`](docs/wildlife-identification.md) — the UI
@@ -20,33 +23,48 @@ the full per-upload technical flow.
 ```mermaid
 flowchart LR
     U[User / Streamlit app] -- put_object --> IN[(S3 input bucket<br/>uploads/ · 7-day purge)]
-    IN -- ObjectCreated<br/>.jpg .jpeg .png .gif --> L[Lambda processor<br/>Python 3.11 · 128 MB · 15 s<br/>X-Ray Active]
+    IN -- Object Created --> EB{EventBridge<br/>rule: uploads/*}
+    EB --> SFN[[Step Functions<br/>Retry ×2, Catch]]
+    SFN -- lambda:invoke --> L[Lambda processor<br/>Python 3.11 · 128 MB · 15 s<br/>X-Ray Active]
+    SFN -. on final failure .-> DLQ[[SQS DLQ]] --> A{{CloudWatch alarm}} --> SNS
     L -- Query by ETag<br/>idempotency --> D[(DynamoDB<br/>image_id / timestamp<br/>StatusIndex GSI)]
     L -- DetectLabels → DetectText → DetectFaces --> R[Amazon Rekognition]
     L -- results/&lt;image_id&gt;.json --> OUT[(S3 output bucket)]
     L -- publish --> SNS[SNS topic] --> M[Email]
-    L -. on failure .-> DLQ[[SQS DLQ]] --> A{{CloudWatch alarm}} --> SNS
+    L -- HTML w/ inline image --> SES[SES] --> M
+    D -- Query --> API[Read API<br/>API Gateway + Lambda]
+    OUT -- SQL --> ATH[Athena / Glue]
     L -- metrics --> CW[CloudWatch dashboard]
-    D -- metrics --> CW
+    SFN -- metrics --> CW
 ```
 
 ### Request flow
 
 1. The client writes `uploads/<name>` to the **input bucket**.
-2. S3 fires an `ObjectCreated` event (suffix-filtered) that invokes the **Lambda**.
-3. Lambda takes the S3 object **ETag as `image_id`** and `Query`s DynamoDB — if a
+2. S3 sends an **Object Created** event to the account's **EventBridge** bus;
+   a rule filtered to the `uploads/` prefix starts a **Step Functions**
+   execution (decoupled — events are on the bus, not a direct S3→Lambda wire).
+3. The state machine builds the `{"Records": [...]}` shape the Lambda expects,
+   then invokes it as a `Task` with **`Retry`** (2 attempts, backoff) and a
+   **`Catch`** that forwards to the **SQS DLQ** on final failure — replacing
+   Lambda's built-in async-retry/DLQ with an explicit, visualisable execution
+   graph per upload (Step Functions console).
+4. Lambda takes the S3 object **ETag as `image_id`** and `Query`s DynamoDB — if a
    row already exists the event is a duplicate and is skipped (idempotency).
-4. If `USE_REKOGNITION=true`, it calls `detect_labels`, then `detect_text` (only
+5. If `USE_REKOGNITION=true`, it calls `detect_labels`, then `detect_text` (only
    if labels came back), then `detect_faces` (only if labels or text came back).
    Otherwise it records a `metadata-only` result. This gating caps Rekognition
    calls at 3 per image and usually fewer.
-5. It writes a summary row to **DynamoDB** and the full result to
+6. It writes a summary row to **DynamoDB** and the full result to
    `results/<image_id>.json` in the **output bucket**.
-6. It publishes a success message to **SNS**. Any exception is published as a
-   failure message and then re-raised so Lambda's async retry (2 attempts) and
-   finally the **SQS DLQ** take over. The DLQ alarm notifies the same SNS topic.
-7. Every call is captured as an **X-Ray** trace (segments for S3, DynamoDB, SNS,
+7. It sends **SNS** (always, guaranteed delivery) and attempts an **SES** HTML
+   email with the image embedded inline (best-effort — can be spam-filtered by
+   strict-DMARC recipient domains even when SES itself accepts it).
+8. Every call is captured as an **X-Ray** trace (segments for S3, DynamoDB, SNS,
    Rekognition via `patch_all()`).
+9. Anyone can query results after the fact via the **read-only HTTP API**
+   (`GET /images`, `GET /images/{image_id}`) or **Athena SQL** over the JSON in
+   the output bucket — no Lambda changes needed for either.
 
 ---
 
@@ -76,11 +94,18 @@ Default config = `use_rekognition = false`. At demo volumes the bill is **$0.00*
 | CloudWatch | 1 dashboard, 1 alarm, Lambda logs | 3 dashboards, 10 alarms, 5 GB logs | **Always free** |
 | X-Ray | Traces from each invoke | 100,000 traces recorded / month | **Always free** |
 | S3 | 2 buckets, small objects, 7-day input purge | 5 GB, 20k GET, 2k PUT | **12 months only**, then ~$0.023/GB-mo |
-| Rekognition | Only if `use_rekognition = true` | 5,000 images / month | **12 months only** — off by default |
+| Rekognition | On by default in the pipeline (12-mo window accepted) | 5,000 images / month | **12 months only**, then ~$1/1,000 images |
+| SES | Rich email on each processed image | 3,000 sends / month | **12 months only**, then ~$0.10/1,000 |
+| Step Functions | 1 Standard execution per image | 4,000 state transitions / month | **Always free** (this uses 3 transitions/image) |
+| EventBridge | 1 rule, default bus | 1M events / month (custom bus tier; default bus is free) | **Always free** |
+| API Gateway (HTTP API) | Read endpoint, throttled 5 rps | 1M requests / month | **12 months only**, then ~$1/million |
+| Glue / Athena | 1 table (no crawler), ad-hoc queries | Glue: 1M objects free; Athena: $5/TB scanned, capped 1 GB/query | Effectively **$0** at this data size |
+| Budgets | 1 cost budget, 2 email alerts | 2 free budgets / account | **Always free** |
 
 Cost guardrails built in: input bucket purges `uploads/` after 7 days, logs
-retain 7 days, DynamoDB is `PAY_PER_REQUEST`, Rekognition calls are gated and
-opt-in.
+retain 7 days, DynamoDB is `PAY_PER_REQUEST`, Rekognition calls are gated,
+Athena queries are capped at 1 GB scanned, the read API is throttled, and an
+AWS Budget emails you at 80% actual / 100% forecasted spend.
 
 ---
 
@@ -237,7 +262,39 @@ as subsegments.
 
 The CloudWatch dashboard (`terraform -chdir=terraform output dashboard_url`) shows
 Lambda invocations/errors/throttles, duration avg + p99, DynamoDB consumed
-capacity, and DLQ backlog.
+capacity, Step Functions executions succeeded/failed, and DLQ backlog. The
+**Step Functions console** (`terraform -chdir=terraform output
+state_machine_console_url`) shows a visual graph of every execution — which
+state it was in, how long each took, and the Retry/Catch path taken on failure.
+
+## Querying results after the fact
+
+**Read API** (no auth, throttled 5 req/s — non-sensitive metadata only):
+
+```bash
+BASE=$(terraform -chdir=terraform output -raw api_base_url)
+curl "$BASE/images?status=processed&limit=10"
+curl "$BASE/images/<image_id>"
+```
+
+**Athena SQL** over every result JSON, no crawler (fixed schema):
+
+```bash
+aws athena start-query-execution \
+  --work-group "$(terraform -chdir=terraform output -raw athena_workgroup)" \
+  --query-string "
+    SELECT image_key, summary, label_count,
+           cardinality(labels) AS n_labels
+    FROM \"$(terraform -chdir=terraform output -raw glue_database)\".results
+    WHERE status = 'processed'
+    ORDER BY \"timestamp\" DESC
+    LIMIT 20
+  "
+# then: aws athena get-query-results --query-execution-id <id from above>
+```
+
+Or run the same query in the Athena console against that workgroup/database —
+capped at 1 GB scanned per query, so a runaway query costs cents at worst.
 
 ---
 
