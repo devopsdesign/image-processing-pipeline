@@ -337,9 +337,9 @@ aws iam create-access-key --user-name cloudsight-streamlit
    OUTPUT_BUCKET  = "cloudsight-intake-output-<ACCOUNT>"
    DYNAMODB_TABLE = "cloudsight-intake-results"
    ```
-5. **Deploy**. You get a public URL like
-   `https://cloudsight-intake-<hash>.streamlit.app` — share it for testing.
-   Every push to `main` redeploys it automatically.
+5. **Deploy**. You get a public URL — this project's is
+   <https://image-processing-pipeline-devops.streamlit.app/> — share it for
+   testing. Every push to `main` redeploys it automatically.
 
 > Keep `use_rekognition = false` for a public demo so anonymous uploads can't run
 > up Rekognition usage. The 7-day input-bucket purge cleans up whatever visitors

@@ -18,18 +18,12 @@ and stored in the cloud.
 
 ### UI link
 
-The uploader is a Streamlit app deployed on **Streamlit Community Cloud**:
+**<https://image-processing-pipeline-devops.streamlit.app/>**
 
-```
-https://<app-name>.streamlit.app
-```
+The uploader is a Streamlit app deployed on **Streamlit Community Cloud**, on
+the auto-generated subdomain for this repo (`<repo>-<owner>.streamlit.app`).
 
-- **Custom subdomain** (set in the app's *Settings → General → App URL*):
-  `https://cloudsight-intake.streamlit.app`
-- **Auto-generated** (if no custom name was chosen):
-  `https://cloudsight-intake-<random-hash>.streamlit.app`
-
-Find the exact URL you deployed:
+To find it again yourself, or if you redeploy under a different name:
 
 1. Go to <https://share.streamlit.io> and sign in with GitHub.
 2. Open the **image-processing-pipeline** app → the URL is shown at the top, or
