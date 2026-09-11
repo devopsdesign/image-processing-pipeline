@@ -11,10 +11,12 @@ the state machine's Catch, with a CloudWatch alarm, and a CloudWatch dashboard
 tracks the whole thing. A monthly AWS Budget emails you if it ever stops being
 free.
 
-**Using it for wildlife / animal identification?** See
-[`docs/wildlife-identification.md`](docs/wildlife-identification.md) — the UI
-access point, a field guide for photographing animals so they identify well, and
-the full per-upload technical flow.
+**Just want to use the app?** See the [User Guide](docs/user-guide.md) — the UI
+link, a step-by-step walkthrough, and how to read your results.
+**Photographing wildlife specifically?** See the
+[Wildlife Identification Guide](docs/wildlife-identification.md) for a field
+guide on getting a clean, confident ID, plus the same technical flow in more
+depth.
 
 ---
 
@@ -65,6 +67,75 @@ flowchart LR
 9. Anyone can query results after the fact via the **read-only HTTP API**
    (`GET /images`, `GET /images/{image_id}`) or **Athena SQL** over the JSON in
    the output bucket — no Lambda changes needed for either.
+
+### Step Functions execution
+
+What actually happens inside the `Task` state on a failure — proven live
+against the deployed stack, not just configured (see
+[Troubleshooting](#troubleshooting)):
+
+```mermaid
+stateDiagram-v2
+    [*] --> BuildS3Event
+    BuildS3Event --> ProcessImage : Records shape built
+    ProcessImage --> [*] : success
+    ProcessImage --> ProcessImage : Retry, max 2 (60s then 120s backoff)
+    ProcessImage --> SendToDLQ : Catch (retries exhausted)
+    SendToDLQ --> [*] : sqs:SendMessage
+```
+
+Every execution — success or failure — gets its own visual graph and timing in
+the [Step Functions console](https://console.aws.amazon.com/states/home)
+(`terraform -chdir=terraform output state_machine_console_url`); a failed one
+shows the exact retry/backoff/catch path taken, and the DLQ message it produces
+carries the original event **plus the full exception trace**.
+
+### AWS resource map
+
+Everything the stack provisions, grouped by role:
+
+```mermaid
+flowchart TB
+    subgraph Ingest
+        UI[Streamlit UI] -->|PutObject| S3IN[(S3 input)]
+        S3IN -->|Object Created| EB{EventBridge}
+    end
+
+    subgraph Orchestrate
+        EB --> SFN[[Step Functions]]
+        SFN -->|Retry x2| LAM[Lambda processor]
+        SFN -.Catch.-> DLQ[[SQS DLQ]]
+    end
+
+    subgraph Analyze
+        LAM --> REK[Amazon Rekognition]
+    end
+
+    subgraph Store
+        LAM --> DDB[(DynamoDB)]
+        LAM --> S3OUT[(S3 output)]
+    end
+
+    subgraph Notify
+        LAM --> SNS[SNS - always]
+        LAM --> SES[SES - best effort]
+        DLQ --> ALM{CloudWatch alarm} --> SNS
+        SNS --> MAIL[Email]
+        SES --> MAIL
+    end
+
+    subgraph Query
+        DDB --> API[API Gateway + reader Lambda]
+        S3OUT --> ATH[Glue / Athena]
+    end
+
+    subgraph "Observe & cost"
+        LAM --> XRAY[X-Ray]
+        LAM --> DASH[CloudWatch dashboard]
+        SFN --> DASH
+        BUD[AWS Budget] --> MAIL
+    end
+```
 
 ---
 

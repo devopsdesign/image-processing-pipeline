@@ -5,6 +5,10 @@ category labels (e.g. `Deer`, `Bird`, `Wildlife`, `Mammal`), confidence scores, 
 readable text (tags, collars, signage), and the raw JSON — all delivered by email
 and stored in the cloud.
 
+> New to the app, or not photographing wildlife specifically? Start with the
+> plain [User Guide](user-guide.md) instead — this page is the field-technique
+> and deeper-technical companion to it.
+
 > **What it can and can't do.** The identification engine is **Amazon Rekognition
 > label detection** — a general-purpose visual classifier. It reliably names the
 > *kind* of animal and prominent attributes (`Antelope`, `Horned`, `Wildlife`,
