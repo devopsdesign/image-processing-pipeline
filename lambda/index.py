@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import unquote_plus
 
 import boto3
 from aws_xray_sdk.core import patch_all
@@ -51,7 +52,12 @@ def handler(event, context):
 
 def _process_record(record):
     bucket = record["s3"]["bucket"]["name"]
-    key = record["s3"]["object"]["key"]
+    # S3 event notification keys are URL-encoded (percent-encoding for non-ASCII
+    # bytes, '+' for spaces) - decode once so every downstream S3/Rekognition
+    # call uses the real key. Without this, any filename with accented/unicode
+    # characters (e.g. macOS NFD-normalized names) fails with
+    # InvalidS3ObjectException / NoSuchKey while looking fine in the console.
+    key = unquote_plus(record["s3"]["object"]["key"])
     image_id = record["s3"]["object"].get("eTag", "").strip('"')
 
     try:

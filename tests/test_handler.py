@@ -114,3 +114,30 @@ def test_rich_email_sent_via_ses_when_configured(index_ses):
 
     quota = boto3.client("ses", region_name=REGION).get_send_quota()
     assert quota["SentLast24Hours"] >= 1
+
+
+def test_url_encoded_unicode_key_is_decoded_before_use(index_ses):
+    # S3 event notifications percent-encode non-ASCII bytes (and '+' for spaces).
+    # A macOS NFD filename like "niños_hojas.jpg" arrives as
+    # "uploads/nin%CC%83os_hojas.jpg" in the event, but the real object in S3
+    # is stored under the decoded key.
+    real_key = "uploads/niños_hojas.jpg"  # n + combining tilde (NFD)
+    encoded_key = "uploads/nin%CC%83os_hojas.jpg"
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket="in-bucket", Key=real_key, Body=b"\xff\xd8\xff\xd9jpegbytes"
+    )
+    event = {
+        "Records": [
+            {"s3": {"bucket": {"name": "in-bucket"}, "object": {"key": encoded_key, "eTag": "unicode123"}}}
+        ]
+    }
+
+    result = index_ses.handler(event, None)["processed"][0]
+
+    assert result["status"] == "processed"
+    assert result["key"] == real_key  # decoded, not the raw percent-encoded string
+
+    # _send_rich_email only succeeds (and SES only gets a send) if it read the
+    # image back from S3 using the correctly decoded key.
+    quota = boto3.client("ses", region_name=REGION).get_send_quota()
+    assert quota["SentLast24Hours"] >= 1
