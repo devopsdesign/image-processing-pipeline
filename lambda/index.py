@@ -35,6 +35,7 @@ OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
 DYNAMODB_TABLE = os.environ["DYNAMODB_TABLE"]
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 USE_REKOGNITION = os.environ.get("USE_REKOGNITION", "false").lower() == "true"
+REKOGNITION_MIN_CONFIDENCE = float(os.environ.get("REKOGNITION_MIN_CONFIDENCE", "50"))
 SES_FROM = os.environ.get("SES_FROM")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL") or SES_FROM
 
@@ -158,7 +159,9 @@ def _analyze(bucket, key):
     image = {"S3Object": {"Bucket": bucket, "Name": key}}
 
     try:
-        resp = rekognition.detect_labels(Image=image, MaxLabels=5, MinConfidence=75)
+        resp = rekognition.detect_labels(
+            Image=image, MaxLabels=10, MinConfidence=REKOGNITION_MIN_CONFIDENCE
+        )
         out["labels"] = [{"name": lbl["Name"], "confidence": round(lbl["Confidence"], 2)} for lbl in resp["Labels"]]
         out["calls"] += 1
     except ClientError:

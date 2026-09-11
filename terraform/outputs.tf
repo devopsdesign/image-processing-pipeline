@@ -52,3 +52,23 @@ output "xray_service_map_url" {
   description = "Direct link to the X-Ray service map."
   value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#xray:service-map/map"
 }
+
+output "api_base_url" {
+  description = "Read-only HTTP API. GET {this}/images or GET {this}/images/<image_id>."
+  value       = aws_apigatewayv2_api.read.api_endpoint
+}
+
+output "athena_workgroup" {
+  description = "Athena workgroup for querying the results table."
+  value       = aws_athena_workgroup.main.name
+}
+
+output "glue_database" {
+  description = "Glue Data Catalog database holding the 'results' table."
+  value       = aws_glue_catalog_database.results.name
+}
+
+output "budget_name" {
+  description = "AWS Budgets monthly cost alert (80% actual / 100% forecasted -> email)."
+  value       = aws_budgets_budget.monthly_cost.name
+}

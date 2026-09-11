@@ -26,6 +26,17 @@ variable "use_rekognition" {
   default     = false
 }
 
+variable "rekognition_min_confidence" {
+  description = "DetectLabels MinConfidence floor (0-100). Lower surfaces more, weaker guesses instead of an empty result."
+  type        = number
+  default     = 50
+
+  validation {
+    condition     = var.rekognition_min_confidence >= 0 && var.rekognition_min_confidence <= 100
+    error_message = "rekognition_min_confidence must be between 0 and 100."
+  }
+}
+
 variable "input_retention_days" {
   description = "Days before objects under uploads/ in the input bucket are purged."
   type        = number
@@ -42,6 +53,12 @@ variable "dlq_alarm_threshold" {
   description = "Number of visible messages in the DLQ that trips the backlog alarm."
   type        = number
   default     = 1
+}
+
+variable "monthly_budget_usd" {
+  description = "AWS Budgets monthly cost threshold (USD) for an early warning if this ever stops being free."
+  type        = number
+  default     = 5
 }
 
 variable "tags" {

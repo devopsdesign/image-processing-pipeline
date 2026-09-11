@@ -259,12 +259,13 @@ resource "aws_lambda_function" "processor" {
 
   environment {
     variables = {
-      OUTPUT_BUCKET   = aws_s3_bucket.output.id
-      DYNAMODB_TABLE  = aws_dynamodb_table.results.name
-      SNS_TOPIC_ARN   = aws_sns_topic.notifications.arn
-      USE_REKOGNITION = tostring(var.use_rekognition)
-      SES_FROM        = var.sns_email
-      NOTIFY_EMAIL    = var.sns_email
+      OUTPUT_BUCKET              = aws_s3_bucket.output.id
+      DYNAMODB_TABLE             = aws_dynamodb_table.results.name
+      SNS_TOPIC_ARN              = aws_sns_topic.notifications.arn
+      USE_REKOGNITION            = tostring(var.use_rekognition)
+      REKOGNITION_MIN_CONFIDENCE = tostring(var.rekognition_min_confidence)
+      SES_FROM                   = var.sns_email
+      NOTIFY_EMAIL               = var.sns_email
     }
   }
 
@@ -492,4 +493,285 @@ resource "aws_cloudwatch_dashboard" "main" {
       },
     ]
   })
+}
+
+# ---------------------------------------------------------------------------
+# Cost guardrail - account-wide monthly budget with email alerts. Catches any
+# spend (Rekognition/SES beyond the 12-month free tier, S3 storage growth,
+# anything else in the account), not just this project's resources.
+# ---------------------------------------------------------------------------
+
+resource "aws_budgets_budget" "monthly_cost" {
+  name         = "${local.name}-monthly-budget"
+  budget_type  = "COST"
+  limit_amount = tostring(var.monthly_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 80
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "ACTUAL"
+    subscriber_email_addresses = [var.sns_email]
+  }
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = [var.sns_email]
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Athena / Glue - ad-hoc SQL over the results JSON, no crawler needed since the
+# schema is fixed and known. Query cost is capped per-query via the workgroup.
+# ---------------------------------------------------------------------------
+
+resource "aws_glue_catalog_database" "results" {
+  name = replace("${local.name}_catalog", "-", "_")
+}
+
+resource "aws_glue_catalog_table" "results" {
+  name          = "results"
+  database_name = aws_glue_catalog_database.results.name
+  table_type    = "EXTERNAL_TABLE"
+
+  parameters = {
+    classification = "json"
+  }
+
+  storage_descriptor {
+    location      = "s3://${aws_s3_bucket.output.id}/results/"
+    input_format  = "org.apache.hadoop.mapred.TextInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+
+    ser_de_info {
+      name                  = "cloudsight-json"
+      serialization_library = "org.openx.data.jsonserde.JsonSerDe"
+    }
+
+    columns {
+      name = "image_id"
+      type = "string"
+    }
+    columns {
+      name = "timestamp"
+      type = "string"
+    }
+    columns {
+      name = "image_key"
+      type = "string"
+    }
+    columns {
+      name = "status"
+      type = "string"
+    }
+    columns {
+      name = "analysis_mode"
+      type = "string"
+    }
+    columns {
+      name = "label_count"
+      type = "int"
+    }
+    columns {
+      name = "text_count"
+      type = "int"
+    }
+    columns {
+      name = "face_count"
+      type = "int"
+    }
+    columns {
+      name = "rekognition_calls"
+      type = "int"
+    }
+    columns {
+      name = "summary"
+      type = "string"
+    }
+    columns {
+      name = "mode"
+      type = "string"
+    }
+    columns {
+      name = "labels"
+      type = "array<struct<name:string,confidence:double>>"
+    }
+    columns {
+      name = "text"
+      type = "array<struct<value:string,confidence:double>>"
+    }
+    columns {
+      name = "faces"
+      type = "array<struct<confidence:double>>"
+    }
+    columns {
+      name = "calls"
+      type = "int"
+    }
+  }
+}
+
+resource "aws_athena_workgroup" "main" {
+  name = "${local.name}-workgroup"
+
+  configuration {
+    enforce_workgroup_configuration    = true
+    publish_cloudwatch_metrics_enabled = true
+    bytes_scanned_cutoff_per_query     = 1073741824 # 1 GB hard cap per query
+
+    result_configuration {
+      output_location = "s3://${aws_s3_bucket.output.id}/athena-results/"
+
+      encryption_configuration {
+        encryption_option = "SSE_S3"
+      }
+    }
+  }
+
+  tags = local.tags
+}
+
+# ---------------------------------------------------------------------------
+# Read API - HTTP API + Lambda for querying processed results (GET only, no
+# auth - non-sensitive metadata only, throttled at the stage to bound cost).
+# ---------------------------------------------------------------------------
+
+data "archive_file" "reader" {
+  type        = "zip"
+  source_file = "${path.module}/../lambda/reader.py"
+  output_path = "${path.module}/dist/reader.zip"
+}
+
+resource "aws_cloudwatch_log_group" "reader" {
+  name              = "/aws/lambda/${local.name}-reader"
+  retention_in_days = var.log_retention_days
+  tags              = local.tags
+}
+
+resource "aws_iam_role" "reader" {
+  name               = "${local.name}-reader-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  tags               = local.tags
+}
+
+data "aws_iam_policy_document" "reader" {
+  statement {
+    sid     = "QueryResults"
+    actions = ["dynamodb:Query", "dynamodb:Scan"]
+    resources = [
+      aws_dynamodb_table.results.arn,
+      "${aws_dynamodb_table.results.arn}/index/*",
+    ]
+  }
+
+  statement {
+    sid = "XRayTracing"
+    actions = [
+      "xray:PutTraceSegments",
+      "xray:PutTelemetryRecords",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "ScopedLogging"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.reader.arn}:*"]
+  }
+}
+
+resource "aws_iam_role_policy" "reader" {
+  name   = "${local.name}-reader-policy"
+  role   = aws_iam_role.reader.id
+  policy = data.aws_iam_policy_document.reader.json
+}
+
+resource "aws_lambda_function" "reader" {
+  function_name    = "${local.name}-reader"
+  role             = aws_iam_role.reader.arn
+  handler          = "reader.handler"
+  runtime          = "python3.11"
+  architectures    = ["x86_64"]
+  memory_size      = 128
+  timeout          = 10
+  filename         = data.archive_file.reader.output_path
+  source_code_hash = data.archive_file.reader.output_base64sha256
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE = aws_dynamodb_table.results.name
+    }
+  }
+
+  tags = local.tags
+
+  depends_on = [
+    aws_iam_role_policy.reader,
+    aws_cloudwatch_log_group.reader,
+  ]
+}
+
+resource "aws_apigatewayv2_api" "read" {
+  name          = "${local.name}-read-api"
+  protocol_type = "HTTP"
+
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["GET"]
+    allow_headers = ["content-type"]
+  }
+
+  tags = local.tags
+}
+
+resource "aws_apigatewayv2_integration" "reader" {
+  api_id                 = aws_apigatewayv2_api.read.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.reader.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "list_images" {
+  api_id    = aws_apigatewayv2_api.read.id
+  route_key = "GET /images"
+  target    = "integrations/${aws_apigatewayv2_integration.reader.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_image" {
+  api_id    = aws_apigatewayv2_api.read.id
+  route_key = "GET /images/{image_id}"
+  target    = "integrations/${aws_apigatewayv2_integration.reader.id}"
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.read.id
+  name        = "$default"
+  auto_deploy = true
+
+  default_route_settings {
+    throttling_burst_limit = 10
+    throttling_rate_limit  = 5
+  }
+
+  tags = local.tags
+}
+
+resource "aws_lambda_permission" "apigw" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.reader.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.read.execution_arn}/*/*"
 }
