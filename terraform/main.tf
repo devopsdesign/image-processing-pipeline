@@ -29,6 +29,9 @@ locals {
   lambda_name = "${var.project_name}-processor"
   image_types = [".jpg", ".jpeg", ".png", ".gif"]
 
+  doctor_email = var.doctor_email != "" ? var.doctor_email : var.sns_email
+  owner_email  = var.owner_email != "" ? var.owner_email : var.sns_email
+
   tags = merge({
     Project   = "CloudSight Intake"
     ManagedBy = "Terraform"
@@ -163,6 +166,7 @@ data "aws_iam_policy_document" "lambda" {
       "rekognition:DetectLabels",
       "rekognition:DetectText",
       "rekognition:DetectFaces",
+      "rekognition:DetectModerationLabels",
     ]
     resources = ["*"]
   }
@@ -259,13 +263,15 @@ resource "aws_lambda_function" "processor" {
 
   environment {
     variables = {
-      OUTPUT_BUCKET              = aws_s3_bucket.output.id
-      DYNAMODB_TABLE             = aws_dynamodb_table.results.name
-      SNS_TOPIC_ARN              = aws_sns_topic.notifications.arn
-      USE_REKOGNITION            = tostring(var.use_rekognition)
-      REKOGNITION_MIN_CONFIDENCE = tostring(var.rekognition_min_confidence)
-      SES_FROM                   = var.sns_email
-      NOTIFY_EMAIL               = var.sns_email
+      OUTPUT_BUCKET                = aws_s3_bucket.output.id
+      DYNAMODB_TABLE               = aws_dynamodb_table.results.name
+      SNS_TOPIC_ARN                = aws_sns_topic.notifications.arn
+      USE_REKOGNITION              = tostring(var.use_rekognition)
+      REKOGNITION_MIN_CONFIDENCE   = tostring(var.rekognition_min_confidence)
+      MEDICAL_CONFIDENCE_THRESHOLD = tostring(var.medical_confidence_threshold)
+      SES_FROM                     = var.sns_email
+      NOTIFY_EMAIL                 = var.sns_email
+      DOCTOR_EMAIL                 = local.doctor_email
     }
   }
 
@@ -564,6 +570,16 @@ resource "aws_sns_topic_subscription" "email" {
   topic_arn = aws_sns_topic.notifications.arn
   protocol  = "email"
   endpoint  = var.sns_email
+}
+
+# Only needed if the doctor's inbox differs from sns_email - the SNS plain-
+# text side of a medical escalation is a topic-wide broadcast, not a per-
+# message "To" address, so the doctor must be subscribed too when different.
+resource "aws_sns_topic_subscription" "doctor" {
+  count     = local.doctor_email != var.sns_email ? 1 : 0
+  topic_arn = aws_sns_topic.notifications.arn
+  protocol  = "email"
+  endpoint  = local.doctor_email
 }
 
 # ---------------------------------------------------------------------------
@@ -955,4 +971,180 @@ resource "aws_lambda_permission" "apigw" {
   function_name = aws_lambda_function.reader.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.read.execution_arn}/*/*"
+}
+
+# ---------------------------------------------------------------------------
+# Cognito - authentication + role groups for the triage app.
+#
+# admin_create_user_config.allow_admin_create_user_only = true: no public
+# self-signup. The Owner (bootstrapped below) creates every other account
+# in-app via AdminCreateUser - appropriate for a fixed ~10-person community.
+# ---------------------------------------------------------------------------
+
+resource "aws_cognito_user_pool" "app" {
+  name = "${local.name}-users"
+
+  password_policy {
+    minimum_length    = 8
+    require_lowercase = true
+    require_numbers   = true
+    require_symbols   = false
+    require_uppercase = true
+  }
+
+  auto_verified_attributes = ["email"]
+
+  admin_create_user_config {
+    allow_admin_create_user_only = true
+  }
+
+  account_recovery_setting {
+    recovery_mechanism {
+      name     = "verified_email"
+      priority = 1
+    }
+  }
+
+  tags = local.tags
+}
+
+resource "aws_cognito_user_pool_client" "app" {
+  name         = "${local.name}-app-client"
+  user_pool_id = aws_cognito_user_pool.app.id
+
+  explicit_auth_flows = [
+    "ALLOW_USER_PASSWORD_AUTH",
+    "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+    "ALLOW_REFRESH_TOKEN_AUTH",
+  ]
+
+  generate_secret = false # public client - called directly from the Streamlit backend
+
+  access_token_validity  = 4
+  id_token_validity      = 4
+  refresh_token_validity = 30
+  token_validity_units {
+    access_token  = "hours"
+    id_token      = "hours"
+    refresh_token = "days"
+  }
+}
+
+resource "aws_cognito_user_group" "owner" {
+  name         = "owner"
+  user_pool_id = aws_cognito_user_pool.app.id
+  description  = "Full admin: user management, all patients, system dashboards"
+  precedence   = 10
+}
+
+resource "aws_cognito_user_group" "poweruser" {
+  name         = "poweruser"
+  user_pool_id = aws_cognito_user_pool.app.id
+  description  = "Local triage staff: review queue, upload on behalf of patients"
+  precedence   = 20
+}
+
+resource "aws_cognito_user_group" "patient" {
+  name         = "patient"
+  user_pool_id = aws_cognito_user_pool.app.id
+  description  = "Own uploads and own results only"
+  precedence   = 30
+}
+
+# Bootstrap account so there is always at least one Owner able to log in and
+# provision everyone else. Cognito emails the temporary password.
+resource "aws_cognito_user" "owner_bootstrap" {
+  user_pool_id = aws_cognito_user_pool.app.id
+  username     = local.owner_email
+
+  attributes = {
+    email          = local.owner_email
+    email_verified = true
+  }
+
+  desired_delivery_mediums = ["EMAIL"]
+}
+
+resource "aws_cognito_user_in_group" "owner_bootstrap" {
+  user_pool_id = aws_cognito_user_pool.app.id
+  username     = aws_cognito_user.owner_bootstrap.username
+  group_name   = aws_cognito_user_group.owner.name
+}
+
+# ---------------------------------------------------------------------------
+# App IAM user - the credentials the Streamlit backend actually runs as.
+# Replaces an earlier ad-hoc, out-of-band IAM user that (on inspection) ended
+# up with no permissions attached at all; this one is fully declared here so
+# its access is reviewable and reproducible.
+# ---------------------------------------------------------------------------
+
+resource "aws_iam_user" "app" {
+  name = "${local.name}-app"
+  tags = local.tags
+}
+
+resource "aws_iam_access_key" "app" {
+  user = aws_iam_user.app.name
+}
+
+data "aws_iam_policy_document" "app" {
+  statement {
+    sid       = "UploadImages"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.input.arn}/uploads/*"]
+  }
+
+  statement {
+    sid       = "ReadResults"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.output.arn}/results/*"]
+  }
+
+  statement {
+    sid     = "QueryResults"
+    actions = ["dynamodb:Query", "dynamodb:Scan", "dynamodb:UpdateItem"]
+    resources = [
+      aws_dynamodb_table.results.arn,
+      "${aws_dynamodb_table.results.arn}/index/*",
+    ]
+  }
+
+  # Admin-prefixed Cognito actions require IAM auth; the plain sign-in flow
+  # (InitiateAuth / RespondToAuthChallenge / GetUser) does not and needs no
+  # grant here - see app/app.py.
+  statement {
+    sid = "ManageUsers"
+    actions = [
+      "cognito-idp:AdminCreateUser",
+      "cognito-idp:AdminAddUserToGroup",
+      "cognito-idp:AdminRemoveUserFromGroup",
+      "cognito-idp:AdminGetUser",
+      "cognito-idp:AdminSetUserPassword",
+      "cognito-idp:AdminListGroupsForUser",
+      "cognito-idp:ListUsers",
+      "cognito-idp:ListUsersInGroup",
+    ]
+    resources = [aws_cognito_user_pool.app.arn]
+  }
+
+  # Lets a Power User's "Escalate to doctor" button send a plain email
+  # directly from the app, for a needs_review item they decide to escalate
+  # manually (the Lambda's own escalation only fires automatically for
+  # classification == "medical").
+  statement {
+    sid       = "ManualEscalationEmail"
+    actions   = ["ses:SendEmail"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ses:FromAddress"
+      values   = [var.sns_email]
+    }
+  }
+}
+
+resource "aws_iam_user_policy" "app" {
+  name   = "${local.name}-app-policy"
+  user   = aws_iam_user.app.name
+  policy = data.aws_iam_policy_document.app.json
 }

@@ -66,3 +66,30 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+# ---------------------------------------------------------------------------
+# Healthcare triage extension (Cognito auth, role-based routing)
+# ---------------------------------------------------------------------------
+
+variable "doctor_email" {
+  description = "Doctor/health-worker inbox for medical-branch escalation emails. Empty = reuse sns_email."
+  type        = string
+  default     = ""
+}
+
+variable "owner_email" {
+  description = "Bootstrap Owner account email (Cognito). Empty = reuse sns_email."
+  type        = string
+  default     = ""
+}
+
+variable "medical_confidence_threshold" {
+  description = "MinConfidence floor for the medical-attention branch specifically - deliberately higher than rekognition_min_confidence, since a false 'no medical attention needed' is the worst failure mode in this app."
+  type        = number
+  default     = 85
+
+  validation {
+    condition     = var.medical_confidence_threshold >= 0 && var.medical_confidence_threshold <= 100
+    error_message = "medical_confidence_threshold must be between 0 and 100."
+  }
+}

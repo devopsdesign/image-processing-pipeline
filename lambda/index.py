@@ -2,11 +2,15 @@
 
 S3 ObjectCreated (uploads/*.jpg|jpeg|png|gif)
   -> ETag-based idempotency check against DynamoDB
-  -> optional cascading Amazon Rekognition (labels -> text -> faces)
+  -> optional cascading Amazon Rekognition (labels -> text -> faces -> moderation)
+  -> classify: medical / non_human / needs_review / unclassified (see _classify)
   -> summary row in DynamoDB + full JSON in the output bucket
-  -> notify: SNS plain-text always (guaranteed delivery) + SES HTML with the
-     image embedded inline, best-effort on top (can be spam-filtered by
-     strict-DMARC recipient domains even when SES itself reports success)
+  -> medical branch only: notify the doctor - SNS plain-text always (guaranteed
+     delivery) + SES HTML with the image embedded inline, best-effort on top
+     (can be spam-filtered by strict-DMARC recipient domains even when SES
+     itself reports success). Other branches are in-app only, by design - see
+     docs/wildlife-identification.md and the code review notes for why this
+     app never auto-labels an image "fake" or "healthy", only "needs a human".
 
 Failures are re-raised so the async invocation lands in the SQS DLQ.
 """
@@ -36,11 +40,33 @@ DYNAMODB_TABLE = os.environ["DYNAMODB_TABLE"]
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 USE_REKOGNITION = os.environ.get("USE_REKOGNITION", "false").lower() == "true"
 REKOGNITION_MIN_CONFIDENCE = float(os.environ.get("REKOGNITION_MIN_CONFIDENCE", "50"))
+MEDICAL_CONFIDENCE_THRESHOLD = float(os.environ.get("MEDICAL_CONFIDENCE_THRESHOLD", "85"))
 SES_FROM = os.environ.get("SES_FROM")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL") or SES_FROM
+DOCTOR_EMAIL = os.environ.get("DOCTOR_EMAIL") or NOTIFY_EMAIL
 
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif")
 MAX_INLINE_BYTES = 6_000_000  # keep the SES raw message under the 10 MB limit
+
+# Generic Rekognition DetectLabels names, not a diagnosis: presence of any of
+# these (above MEDICAL_CONFIDENCE_THRESHOLD) means "a person's body is the
+# subject", which is treated as needing a doctor's eyes - this app never tries
+# to auto-decide "healthy" vs. "injured" from labels alone. See the code
+# review notes on why Rekognition cannot do real medical/authenticity detection.
+MEDICAL_LABELS = frozenset(
+    {
+        "person", "human", "people", "face", "head", "skin", "arm", "hand",
+        "leg", "foot", "finger", "body part", "wound", "wrist", "elbow",
+        "knee", "shoulder", "torso", "back", "chest", "eye", "ear", "nose",
+        "mouth", "lip", "tooth", "hair", "nail",
+    }
+)
+NON_HUMAN_LABELS = frozenset(
+    {
+        "animal", "toy", "furniture", "electronics", "vehicle", "plant",
+        "food", "appliance", "tool", "machine", "building",
+    }
+)
 
 s3 = boto3.client("s3")
 rekognition = boto3.client("rekognition")
@@ -51,6 +77,14 @@ table = boto3.resource("dynamodb").Table(DYNAMODB_TABLE)
 
 def handler(event, context):
     return {"processed": [_process_record(r) for r in event.get("Records", [])]}
+
+
+def _uploader_from_key(key):
+    """uploads/<username>/<file> -> username (patient/health-worker apps use
+    this convention so results can be scoped per patient); uploads/<file> (the
+    original flat convention) -> "unknown", so existing callers are unaffected."""
+    parts = key.split("/")
+    return parts[1] if len(parts) >= 3 and parts[0] == "uploads" else "unknown"
 
 
 def _process_record(record):
@@ -76,6 +110,8 @@ def _process_record(record):
             return {"key": key, "image_id": image_id, "status": "skipped", "reason": "duplicate"}
 
         analysis = _analyze(bucket, key) if USE_REKOGNITION else _metadata_only()
+        moderation = _moderation(bucket, key) if USE_REKOGNITION else []
+        classification = _classify(analysis, moderation)
         summary = _summarize(analysis)
         now = datetime.now(UTC).isoformat()
 
@@ -90,6 +126,10 @@ def _process_record(record):
             "face_count": len(analysis["faces"]),
             "rekognition_calls": analysis["calls"],
             "summary": summary,
+            "classification": classification,
+            "moderation_flag_count": len(moderation),
+            "escalation_status": "escalated" if classification == "medical" else "n/a",
+            "uploaded_by": _uploader_from_key(key),
         }
         table.put_item(Item=item)
 
@@ -97,10 +137,24 @@ def _process_record(record):
         s3.put_object(
             Bucket=OUTPUT_BUCKET,
             Key=result_key,
-            Body=json.dumps({**item, **analysis}, default=str),
+            Body=json.dumps({**item, **analysis, "moderation": moderation}, default=str),
             ContentType="application/json",
         )
 
+        if classification != "medical":
+            # non_human / needs_review / unclassified: in-app only, by design.
+            # A Power User sees needs_review items in their review queue; no
+            # email goes out for any of these branches - see module docstring.
+            logger.info("classification=%s for %s - in-app only", classification, key)
+            return {
+                "key": key,
+                "image_id": image_id,
+                "status": "processed",
+                "classification": classification,
+                "summary": summary,
+            }
+
+        # ---- medical branch only: escalate to the doctor ----
         try:
             preview_url = s3.generate_presigned_url(
                 "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600
@@ -108,9 +162,9 @@ def _process_record(record):
         except ClientError:
             preview_url = ""
 
-        subject = f"[CloudSight] processed {key.rsplit('/', 1)[-1]}"[:100]
+        subject = f"[CloudSight] Medical attention flagged: {key.rsplit('/', 1)[-1]}"[:100]
         plain_body = (
-            "CloudSight Intake - image processed\n\n"
+            "CloudSight Intake - a patient photo needs medical review\n\n"
             f"Image:    {key}\n"
             f"ETag:     {image_id}\n"
             f"Status:   {analysis['status']} ({analysis['mode']})\n"
@@ -118,6 +172,7 @@ def _process_record(record):
             f"{_labels_line(analysis)}\n"
             f"Result:   s3://{OUTPUT_BUCKET}/{result_key}\n"
             + (f"\nFull-size image (SigV4 link, ~1h):\n{preview_url}\n" if preview_url else "")
+            + "\nThis is an automated screening aid, not a diagnosis. Please review.\n"
         )
 
         # SNS plain-text always goes out - it's the guaranteed-delivery channel
@@ -126,10 +181,18 @@ def _process_record(record):
         # can an SES email claiming to be From: you@protonmail.com). The SES HTML
         # copy with the image embedded inline is a best-effort bonus on top.
         _publish(subject=subject, message=plain_body, best_effort=True)
-        rich_sent = _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summary, result_key)
-        logger.info("Notifications sent: sns=True ses=%s", rich_sent)
+        rich_sent = _send_rich_email(
+            subject, plain_body, bucket, key, image_id, analysis, summary, result_key, to_addr=DOCTOR_EMAIL
+        )
+        logger.info("Doctor notified: sns=True ses=%s", rich_sent)
 
-        return {"key": key, "image_id": image_id, "status": "processed", "summary": summary}
+        return {
+            "key": key,
+            "image_id": image_id,
+            "status": "processed",
+            "classification": classification,
+            "summary": summary,
+        }
 
     except Exception as exc:  # noqa: BLE001 - notify, then let the DLQ catch it
         logger.exception("Processing failed for %s", key)
@@ -193,6 +256,50 @@ def _analyze(bucket, key):
     return out
 
 
+def _moderation(bucket, key):
+    try:
+        resp = rekognition.detect_moderation_labels(Image={"S3Object": {"Bucket": bucket, "Name": key}})
+        return [
+            {"name": m["Name"], "confidence": round(m["Confidence"], 2)} for m in resp.get("ModerationLabels", [])
+        ]
+    except ClientError:
+        logger.warning("detect_moderation_labels failed", exc_info=True)
+        return []
+
+
+def _classify(analysis, moderation):
+    """medical / non_human / needs_review / unclassified.
+
+    Deliberately conservative: this never auto-decides "fake" or "healthy" -
+    anything ambiguous routes to needs_review for a Power User to look at.
+    Rekognition has no medical-diagnosis or image-authenticity capability;
+    see the code review notes for why this is the safe shape for that gap.
+    """
+    if analysis["mode"] == "metadata-only":
+        return "unclassified"
+
+    labels = analysis["labels"]
+    names = {lbl["name"].lower() for lbl in labels}
+
+    has_medical = any(
+        lbl["name"].lower() in MEDICAL_LABELS and lbl["confidence"] >= MEDICAL_CONFIDENCE_THRESHOLD
+        for lbl in labels
+    )
+    if has_medical:
+        return "medical"
+
+    if moderation:
+        return "needs_review"
+
+    if not labels:
+        return "needs_review"
+
+    if names & NON_HUMAN_LABELS:
+        return "non_human"
+
+    return "needs_review"
+
+
 def _summarize(analysis):
     parts = []
     if analysis["labels"]:
@@ -221,8 +328,9 @@ def _labels_line(analysis):
     return "Labels:   (none detected)"
 
 
-def _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summary, result_key):
+def _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summary, result_key, to_addr=None):
     """HTML email with the uploaded image embedded inline (CID). True if SES sent it."""
+    to_addr = to_addr or NOTIFY_EMAIL
     if not SES_FROM:
         return False
     try:
@@ -267,7 +375,7 @@ def _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summa
     msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = SES_FROM
-    msg["To"] = NOTIFY_EMAIL
+    msg["To"] = to_addr
     alt = MIMEMultipart("alternative")
     msg.attach(alt)
     alt.attach(MIMEText(plain_body, "plain"))
@@ -279,10 +387,8 @@ def _send_rich_email(subject, plain_body, bucket, key, image_id, analysis, summa
         msg.attach(part)
 
     try:
-        ses.send_raw_email(
-            Source=SES_FROM, Destinations=[NOTIFY_EMAIL], RawMessage={"Data": msg.as_string()}
-        )
-        logger.info("Rich email sent via SES to %s", NOTIFY_EMAIL)
+        ses.send_raw_email(Source=SES_FROM, Destinations=[to_addr], RawMessage={"Data": msg.as_string()})
+        logger.info("Rich email sent via SES to %s", to_addr)
         return True
     except ClientError:
         logger.warning("SES send failed - falling back to SNS", exc_info=True)

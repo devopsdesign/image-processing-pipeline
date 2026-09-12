@@ -82,3 +82,29 @@ output "state_machine_console_url" {
   description = "Direct link to the state machine's execution list."
   value       = "https://${var.aws_region}.console.aws.amazon.com/states/home?region=${var.aws_region}#/statemachines/view/${aws_sfn_state_machine.processor.arn}"
 }
+
+output "cognito_user_pool_id" {
+  description = "Cognito User Pool ID - put in the app's secrets as COGNITO_USER_POOL_ID."
+  value       = aws_cognito_user_pool.app.id
+}
+
+output "cognito_app_client_id" {
+  description = "Cognito App Client ID - put in the app's secrets as COGNITO_CLIENT_ID."
+  value       = aws_cognito_user_pool_client.app.id
+}
+
+output "owner_bootstrap_username" {
+  description = "Bootstrap Owner login (email). Check that inbox for the Cognito temporary-password email."
+  value       = aws_cognito_user.owner_bootstrap.username
+}
+
+output "app_iam_access_key_id" {
+  description = "Access key ID for the app's IAM user - put in the app's secrets as AWS_ACCESS_KEY_ID."
+  value       = aws_iam_access_key.app.id
+}
+
+output "app_iam_secret_access_key" {
+  description = "Secret access key - put in the app's secrets as AWS_SECRET_ACCESS_KEY. Sensitive: only shown with -raw or terraform output -json."
+  value       = aws_iam_access_key.app.secret
+  sensitive   = true
+}
