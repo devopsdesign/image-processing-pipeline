@@ -328,7 +328,11 @@ def my_results_section(auth):
 def review_queue_section(auth):
     st.subheader("Review queue")
     try:
-        resp = TABLE.scan(FilterExpression=Attr("classification").eq("needs_review"))
+        # classification never changes once set, so filter on escalation_status
+        # too - otherwise a resolved/escalated item would never leave the queue.
+        resp = TABLE.scan(
+            FilterExpression=Attr("classification").eq("needs_review") & Attr("escalation_status").eq("n/a")
+        )
     except (ClientError, BotoCoreError) as exc:
         st.error(f"Could not load the queue: {exc}")
         return
