@@ -109,7 +109,12 @@ def _role_of(groups):
 def _complete_login(auth_result, username):
     claims = _decode_id_token(auth_result["IdToken"])
     groups = claims.get("cognito:groups", [])
-    st.session_state.auth = {"username": username, "groups": groups, "role": _role_of(groups)}
+    st.session_state.auth = {
+        "username": username,
+        "groups": groups,
+        "role": _role_of(groups),
+        "access_token": auth_result["AccessToken"],
+    }
     st.session_state.pop("challenge", None)
     st.rerun()
 
@@ -186,6 +191,25 @@ def logout_sidebar(auth):
     with st.sidebar:
         st.write(f"**{auth['username']}**")
         st.caption(f"Role: {auth['role']}")
+
+        with st.expander("Change password"):
+            with st.form("change_password"):
+                old_pw = st.text_input("Current password", type="password")
+                new_pw = st.text_input("New password", type="password")
+                confirm_pw = st.text_input("Confirm new password", type="password")
+                submitted = st.form_submit_button("Update password")
+            if submitted:
+                if new_pw != confirm_pw:
+                    st.error("New passwords don't match.")
+                else:
+                    try:
+                        CLIENTS["cognito_public"].change_password(
+                            PreviousPassword=old_pw, ProposedPassword=new_pw, AccessToken=auth["access_token"]
+                        )
+                        st.success("Password updated.")
+                    except (ClientError, BotoCoreError) as exc:
+                        st.error(f"Could not update password: {exc}")
+
         if st.button("Log out"):
             st.session_state.pop("auth", None)
             st.rerun()
@@ -370,7 +394,7 @@ def _manual_escalate(item, auth):
 # --------------------------------------------------------------------------- owner view
 
 
-def manage_users_section():
+def manage_users_section(auth):
     st.subheader("Manage users")
 
     with st.form("create_user"):
@@ -402,6 +426,7 @@ def manage_users_section():
         st.error(f"Could not list users: {exc}")
         return
 
+    rows = []
     for u in users:
         try:
             groups = [
@@ -412,7 +437,27 @@ def manage_users_section():
             ]
         except (ClientError, BotoCoreError):
             groups = ["?"]
-        st.write(f"- **{u['Username']}** — {', '.join(groups) or 'no group'} — {u['UserStatus']}")
+        rows.append((u["Username"], groups, u["UserStatus"]))
+
+    owner_count = sum(1 for _, groups, _ in rows if "owner" in groups)
+
+    for username, groups, status in rows:
+        c1, c2 = st.columns([4, 1])
+        c1.write(f"**{username}** — {', '.join(groups) or 'no group'} — {status}")
+
+        is_self = username == auth["username"]
+        is_last_owner = "owner" in groups and owner_count <= 1
+        if is_self or is_last_owner:
+            c2.caption("can't delete self" if is_self else "last owner")
+            continue
+
+        if c2.button("Delete", key=f"delete-user-{username}"):
+            try:
+                CLIENTS["cognito"].admin_delete_user(UserPoolId=USER_POOL_ID, Username=username)
+                st.success(f"Deleted {username}.")
+                st.rerun()
+            except (ClientError, BotoCoreError) as exc:
+                st.error(f"Could not delete {username}: {exc}")
 
 
 # --------------------------------------------------------------------------- main
@@ -454,4 +499,4 @@ elif auth["role"] == "poweruser":
 elif auth["role"] == "owner":
     review_queue_section(auth)
     st.divider()
-    manage_users_section()
+    manage_users_section(auth)
