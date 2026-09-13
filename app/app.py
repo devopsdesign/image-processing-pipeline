@@ -325,7 +325,17 @@ def my_results_section(auth):
 # --------------------------------------------------------------------------- power user / owner view
 
 
+def _require_role(auth, *allowed):
+    """Defense-in-depth: the caller in main() already gates on role, but a
+    future refactor could accidentally call one of these from the wrong
+    branch. Cheap, redundant insurance for the two privileged sections."""
+    if auth["role"] not in allowed:
+        st.error("You don't have permission to view this.")
+        st.stop()
+
+
 def review_queue_section(auth):
+    _require_role(auth, "poweruser", "owner")
     st.subheader("Review queue")
     try:
         # classification never changes once set, so filter on escalation_status
@@ -399,6 +409,7 @@ def _manual_escalate(item, auth):
 
 
 def manage_users_section(auth):
+    _require_role(auth, "owner")
     st.subheader("Manage users")
 
     with st.form("create_user"):

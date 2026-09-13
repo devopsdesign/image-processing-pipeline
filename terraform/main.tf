@@ -86,6 +86,53 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "output" {
   }
 }
 
+# Deny any request over plain HTTP - the buckets hold patient photos / results.
+data "aws_iam_policy_document" "require_tls" {
+  statement {
+    sid       = "DenyInsecureTransport"
+    effect    = "Deny"
+    actions   = ["s3:*"]
+    resources = ["${aws_s3_bucket.input.arn}", "${aws_s3_bucket.input.arn}/*"]
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "input" {
+  bucket = aws_s3_bucket.input.id
+  policy = data.aws_iam_policy_document.require_tls.json
+}
+
+data "aws_iam_policy_document" "require_tls_output" {
+  statement {
+    sid       = "DenyInsecureTransport"
+    effect    = "Deny"
+    actions   = ["s3:*"]
+    resources = ["${aws_s3_bucket.output.arn}", "${aws_s3_bucket.output.arn}/*"]
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "output" {
+  bucket = aws_s3_bucket.output.id
+  policy = data.aws_iam_policy_document.require_tls_output.json
+}
+
 resource "aws_s3_bucket_lifecycle_configuration" "input" {
   bucket = aws_s3_bucket.input.id
 
@@ -252,6 +299,11 @@ resource "aws_lambda_function" "processor" {
   timeout          = 15
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
+
+  # Caps concurrent invocations - at ~10 users this is far more than ever
+  # needed, but it hard-bounds worst-case Rekognition spend and blast radius
+  # from any runaway/abusive upload burst.
+  reserved_concurrent_executions = var.lambda_reserved_concurrency
 
   tracing_config {
     mode = "Active"
@@ -552,6 +604,13 @@ resource "aws_dynamodb_table" "results" {
     hash_key        = "status"
     range_key       = "timestamp"
     projection_type = "ALL"
+  }
+
+  # Continuous backups for accidental-delete/overwrite recovery. Cost scales
+  # with table size (pennies at this table's tiny size) - worth it given the
+  # table holds patient screening records.
+  point_in_time_recovery {
+    enabled = true
   }
 
   tags = local.tags
@@ -924,11 +983,9 @@ resource "aws_apigatewayv2_api" "read" {
   name          = "${local.name}-read-api"
   protocol_type = "HTTP"
 
-  cors_configuration {
-    allow_origins = ["*"]
-    allow_methods = ["GET"]
-    allow_headers = ["content-type"]
-  }
+  # No cors_configuration: this now requires SigV4-signed AWS_IAM auth (below),
+  # which a browser's anonymous fetch can't provide anyway - CORS would be
+  # dead weight, not a mitigation.
 
   tags = local.tags
 }
@@ -940,16 +997,23 @@ resource "aws_apigatewayv2_integration" "reader" {
   payload_format_version = "2.0"
 }
 
+# AWS_IAM auth: the results (filenames double as patient identifiers, plus
+# medical/non_human/needs_review classification) are sensitive enough that
+# this can no longer be a fully public, unauthenticated endpoint. Only a
+# SigV4-signed caller with execute-api:Invoke on this API can reach it now -
+# grant that explicitly to whichever IAM principal needs to call it.
 resource "aws_apigatewayv2_route" "list_images" {
-  api_id    = aws_apigatewayv2_api.read.id
-  route_key = "GET /images"
-  target    = "integrations/${aws_apigatewayv2_integration.reader.id}"
+  api_id             = aws_apigatewayv2_api.read.id
+  route_key          = "GET /images"
+  target             = "integrations/${aws_apigatewayv2_integration.reader.id}"
+  authorization_type = "AWS_IAM"
 }
 
 resource "aws_apigatewayv2_route" "get_image" {
-  api_id    = aws_apigatewayv2_api.read.id
-  route_key = "GET /images/{image_id}"
-  target    = "integrations/${aws_apigatewayv2_integration.reader.id}"
+  api_id             = aws_apigatewayv2_api.read.id
+  route_key          = "GET /images/{image_id}"
+  target             = "integrations/${aws_apigatewayv2_integration.reader.id}"
+  authorization_type = "AWS_IAM"
 }
 
 resource "aws_apigatewayv2_stage" "default" {

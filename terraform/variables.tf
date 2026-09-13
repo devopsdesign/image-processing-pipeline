@@ -83,6 +83,12 @@ variable "owner_email" {
   default     = ""
 }
 
+variable "lambda_reserved_concurrency" {
+  description = "Hard cap on concurrent processor Lambda invocations - bounds worst-case Rekognition spend / abuse blast radius."
+  type        = number
+  default     = 5
+}
+
 variable "medical_confidence_threshold" {
   description = "MinConfidence floor for the medical-attention branch specifically - deliberately higher than rekognition_min_confidence, since a false 'no medical attention needed' is the worst failure mode in this app."
   type        = number
