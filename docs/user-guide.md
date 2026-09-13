@@ -1,132 +1,159 @@
 # CloudSight Intake — User Guide
 
-A plain-language walkthrough of the app: where to go, what to click, and how to
-read what comes back. If you're photographing animals specifically, see the
-[Wildlife Identification Guide](wildlife-identification.md) for photo tips. If
-you're a developer, see the [README](../README.md) for the technical internals.
+A plain-language walkthrough for patients and health workers: where to go, what
+to click, and how to read what comes back. If you're a developer, see the
+[README](../README.md) for the technical internals.
+
+> **This is a screening aid, not a diagnosis.** It flags photos that look like
+> they may need a doctor's attention so a real person can review them — it
+> does not itself diagnose anything. Always follow up with your health worker
+> or doctor for anything urgent, regardless of what the app shows.
 
 ## What this does
 
-You upload a photo. Within a few seconds it comes back with a **description of
-what's in it** — labels like "Dog," "Laptop," "Person," each with a confidence
-score — plus any readable text in the photo, and how many faces it found. You
-get the result on-screen immediately, and by email as well.
+You log in, upload a photo, and within a few seconds it's automatically routed:
+
+- **Sent to a doctor for review** — if the photo appears to show a person/body
+  part.
+- **Rejected as not a valid subject** — if it doesn't look like a relevant
+  photo (an object, an animal, a screenshot, etc.).
+- **Sent for manual review** — if the result is unclear either way; a local
+  health worker looks at it directly.
 
 ## Where to go
 
 **<https://image-processing-pipeline-devops.streamlit.app/>**
 
-Nothing to install — it's a page in your browser, on desktop or mobile.
+Nothing to install — it's a page in your browser, on desktop or mobile. You
+need an account first (see [Quick Start](#quick-start) below) — there's no
+public sign-up, accounts are created for you.
 
-## Step by step
+## Quick Start
 
-**1. Open the link and choose a photo.**
+**1. Log in.** Your health worker or admin gives you a link and your login
+email. On first login you'll be asked to set a permanent password:
 
 ```
 ┌───────────────────────────────────────────────────┐
-│ 🛰️  CloudSight Intake                              │
-│  Upload an image → S3 event → Lambda + Rekognition │
-│  → DynamoDB + S3 results                            │
+│ 🩺  CloudSight Triage                               │
+│  Sign in to continue                                │
 ├───────────────────────────────────────────────────┤
-│  Choose a JPG or PNG image                          │
-│  [ Browse files ]   ← click here                    │
+│  Email     [___________________]                    │
+│  Password  [___________________]                    │
+│              [ Log in ]  ← click here                │
+└───────────────────────────────────────────────────┘
+```
+
+**2. Choose a photo and submit it.**
+
+```
+┌───────────────────────────────────────────────────┐
+│  Submit a photo for screening                        │
+│  Choose a JPG or PNG photo                           │
+│  [ Browse files ]   ← click here                     │
+│                                                       │
+│  [ your photo preview appears here ]                 │
+│              [ Submit for screening ]                │
 └───────────────────────────────────────────────────┘
 ```
 
 Only `.jpg`, `.jpeg`, and `.png` files are accepted.
 
-**2. Preview it, then click Process image.**
+**3. Wait a few seconds, then read the result.**
 
 ```
 ┌───────────────────────────────────────────────────┐
-│  [ your photo appears here ]                        │
-│  image_id (ETag): 7f3a9c1e2b4d6f80...               │
+│  Analyzing… (3/20)                                   │
+├───────────────────────────────────────────────────┤
+│  ✅ Submitted to your doctor for review.             │
+│     This is a screening aid, not a diagnosis.        │
 │                                                       │
-│              [ Process image ]  ← click here         │
+│  ▾ Details                                            │
+│    Labels: 5   Text items: 1   Faces: 1               │
+│    Summary: 5 labels, 1 text item, 1 faces            │
 └───────────────────────────────────────────────────┘
 ```
 
-The long string under your photo (`image_id`) is just an internal fingerprint
-of the file — it's how the app finds your result again a moment later. You
-don't need to do anything with it.
+Typically **2–10 seconds**. You'll see one of three messages (see
+[Understanding your results](#understanding-your-results)), and — for anything
+sent to the doctor — an email goes out automatically too.
 
-**3. Wait a few seconds.**
+## Photo Guidelines
 
-```
-┌───────────────────────────────────────────────────┐
-│  ⏳ Waiting for the pipeline…                        │
-│     polling… 3s                                      │
-│     polling… 6s                                      │
-└───────────────────────────────────────────────────┘
-```
+Good technique moves a result from "unclear, sent for manual review" to a
+confident, correctly-routed one:
 
-Typically **2–10 seconds**. If it's still going after a minute or two, see
-[Troubleshooting](#troubleshooting) below — the page will eventually say so
-itself and won't leave you guessing forever (it gives up after 90 seconds).
+- **Good lighting.** Soft, even light beats harsh shadows or backlighting.
+  Don't shoot with a bright window or lamp behind the subject.
+- **Focus.** Hold the phone steady; tap the screen on the area of concern
+  before taking the photo so it's sharp, not blurry.
+- **Framing.** Fill most of the frame with the area of concern, with a little
+  surrounding context — not an extreme close-up, not a distant shot.
+- **One subject per photo.** Don't include other people, pets, or objects in
+  frame.
+- **A few angles help.** If more than one angle is relevant, upload each as a
+  separate photo — every file gets its own result.
 
-**4. Read your result.**
+### Handling rejections
 
-```
-┌───────────────────────────────────────────────────┐
-│  ✅ Done in 4.2s                                     │
-│  ✅ Image processed — status "processed"             │
-│                                                       │
-│  Processing time   Labels   Text items   Faces       │
-│       4.2 s           5         1          0         │
-│                                                       │
-│  Analysis mode: rekognition · Rekognition calls: 3    │
-│  Summary: 5 labels, 1 text item                       │
-│                                                       │
-│  ▾ Summary JSON                                       │
-│    { "labels": [ {"name": "Dog", "confidence": 98.7}… │
-└───────────────────────────────────────────────────┘
-```
+- **"We couldn't recognize a valid subject in this photo"** — the system
+  didn't detect a person/body part at all (e.g. it was actually a photo of an
+  object, screen, or document). This is not an error — retake a photo that
+  clearly shows the area of concern.
+- **"Sent for manual review"** — not a rejection. A health worker will look at
+  it directly, usually within a few hours. You don't need to do anything.
 
 ## Understanding your results
 
 | Field | What it means |
 |---|---|
-| **Status** | `processed` = it finished. `skipped` = didn't run (wrong file type, or you already uploaded this exact file before). |
-| **Processing time** | Seconds from your click to the result appearing — end to end, not just the AI part. |
-| **Labels** | What's in the photo, most confident first — e.g. "Dog 98.7%, Animal 97.1%, Grass 82.3%." Higher % = more confident. |
-| **Text items** | Any readable text found in the photo (signs, tags, labels on objects). |
-| **Faces** | How many human faces were detected — just a count, not who they are. |
-| **Summary JSON** | The full, exact data behind the result — every label, every confidence score, every piece of text. Click to expand it. |
-
-A result with only 1–2 generic labels and low confidence (under ~90%) usually
-means the photo was unclear, too far away, or busy with multiple subjects —
-not a bug. Try a clearer, closer, better-lit shot of one subject and re-upload.
+| **Result message** | `Submitted to your doctor` (medical), `couldn't recognize a valid subject` (rejected), or `sent for manual review` (unclear) — see [What this does](#what-this-does). |
+| **Labels** | What the system detected, most confident first. Higher % = more confident. |
+| **Text items** | Any readable text found in the photo. |
+| **Faces** | How many human faces were detected — just a count. |
+| **Summary** | A one-line recap of the above. |
 
 ## Getting notified by email
 
-Every processed image also sends an email, so you don't have to keep the
-browser tab open. You may get **two**:
+Only photos routed to a doctor trigger an email — rejections and manual-review
+items are in-app only, by design. When one does go out, you may get **two**:
 
-1. **A plain-text email** — always sent, guaranteed to arrive. Contains the
-   status, summary, and labels as plain text plus a link to view the photo
-   (the link expires after about an hour).
-2. **A nicer HTML email** — sent as a bonus, with your **photo embedded right
-   in the message** plus a labels table. This one can occasionally be filtered
-   to Spam by strict mail providers (this happens with some ProtonMail
-   addresses, for technical reasons unrelated to the content) — check there if
-   you don't see it in your inbox.
+1. **A plain-text email** — always sent, guaranteed to arrive.
+2. **A nicer HTML email** — sent as a bonus, with the photo embedded inline.
+   This one can occasionally be filtered to Spam by strict mail providers —
+   check there if you don't see it.
 
-Either way, you'll always get at least the first one.
+## Role Instructions
+
+**Patients**: log in, submit your own photos, and see your own results under
+**My results**. You can't see anyone else's information.
+
+**Power Users (local triage staff)**: in addition to submitting on a patient's
+behalf (enter their email as the "Patient identifier"), you have a **Review
+queue** — every photo the system couldn't confidently route lands there for
+you to look at and either **Mark resolved** or **Escalate to doctor**
+yourself. You can also see any patient's history.
+
+**Owners (system admins)**: everything above, plus **Manage users** — create
+new accounts (choosing their role), delete accounts, and see who's registered.
+Use this power sparingly; changes here affect real accounts.
+
+Everyone can change their own password any time from the sidebar.
 
 ## Troubleshooting
 
 | What you see | What it means | What to do |
 |---|---|---|
-| Stuck on "Waiting for the pipeline…" | Rare backend hiccup, or a very unusual file | Wait up to 90s; if it times out, just try uploading again |
-| `status: skipped`, reason `unsupported_type` | The file isn't a `.jpg`/`.jpeg`/`.png` | Convert or re-export the photo and try again |
-| `status: skipped`, reason `duplicate` | You (or someone) already uploaded this exact file | Not an error — see the earlier result, or make a trivial change to the file (e.g. re-save it) if you want a fresh run |
-| Only 1–2 vague labels, low confidence | Photo is unclear/busy/far away | See [Understanding your results](#understanding-your-results) above, or the [photo tips](wildlife-identification.md#2-field-guide--taking-photos-that-identify-well) |
-| No email at all | Check Spam/Junk first | If it's truly missing every time, flag it — something's actually wrong |
-| The page shows an AWS error message | The backend isn't deployed or is misconfigured | This is a "call the developer" situation — not something to fix from the browser |
+| Can't log in / forced to set a new password | Normal on first login for a new account | Set any password meeting the requirements (8+ characters, upper + lower + a number) and you're in |
+| Stuck on "Analyzing…" | Rare backend hiccup, or a very unusual file | Wait up to 90s; if it times out, just try submitting again |
+| "Couldn't recognize a valid subject" | See [Handling rejections](#handling-rejections) | Retake the photo — closer, better lit, one subject, clearly showing the area of concern |
+| Submitted twice, no new result | You (or someone) already uploaded this exact file | Not an error — re-save or lightly edit the photo if you want a fresh run |
+| No email after a doctor-routed result | Check Spam/Junk first | If it's truly missing every time, tell your admin — something's actually wrong |
+| Connectivity issues mid-upload | Weak signal/Wi-Fi | Move somewhere with better connectivity and submit again; nothing is double-charged or double-processed |
+| The page shows an AWS error message | The backend isn't deployed or is misconfigured | This is a "tell your admin" situation, not something to fix from the browser |
 
-## Who this is for
+## Privacy
 
-Anyone with the link — no account, no login. Uploaded photos and their results
-are not private: don't upload anything sensitive. Results (filenames, labels,
-text found) are also queryable by anyone with API/AWS access via the read API
-described in the README — again, nothing sensitive.
+Only logged-in accounts can use this app — there's no public access. Everyone
+who can use it can see their own data only (Patients) or more (Power
+Users/Owners), per the roles above. Don't share your login.

@@ -1,22 +1,27 @@
 # CloudSight Intake
 
-A production-shaped, fully serverless image-processing pipeline on AWS that stays
-inside the **AWS Always-Free tier** in its default configuration.
+A production-shaped, serverless image-triage pipeline on AWS, built as a small
+(~10-user) community health-screening tool, that stays inside the **AWS
+Always-Free tier** in its default configuration.
 
-Upload an image → S3 event → EventBridge → Step Functions → Lambda (X-Ray
-traced) → optional cascading Amazon Rekognition → summary in DynamoDB + full
-JSON in S3 → SES/SNS notification, plus a read-only HTTP API and Athena SQL
-over the results. Failures retry and then land in an SQS dead-letter queue via
-the state machine's Catch, with a CloudWatch alarm, and a CloudWatch dashboard
-tracks the whole thing. A monthly AWS Budget emails you if it ever stops being
-free.
+Cognito login (Patient / Power User / Owner roles) → upload → S3 event →
+EventBridge → Step Functions → Lambda (X-Ray traced) → cascading Amazon
+Rekognition → **classified** as `medical` / `non_human` / `needs_review` →
+summary in DynamoDB + full JSON in S3. Only the `medical` branch notifies a
+doctor (SES/SNS); the others are in-app only. A Power User review queue and an
+Owner user-management screen round out the app. Failures retry and then land
+in an SQS dead-letter queue via the state machine's Catch, with a CloudWatch
+alarm, and a CloudWatch dashboard tracks the whole thing. A monthly AWS Budget
+emails you if it ever stops being free.
 
-**Just want to use the app?** See the [User Guide](docs/user-guide.md) — the UI
-link, a step-by-step walkthrough, and how to read your results.
-**Photographing wildlife specifically?** See the
-[Wildlife Identification Guide](docs/wildlife-identification.md) for a field
-guide on getting a clean, confident ID, plus the same technical flow in more
-depth.
+**Just want to use the app?** See the [User Guide](docs/user-guide.md) — the
+UI link, login, photo guidelines, role-by-role instructions, and how to read
+your results.
+
+> **Not cleared for public/general use.** This is reviewed and hardened for a
+> small, known set of trusted users, not the general public — see
+> [Security & readiness](#security--readiness) below before considering wider
+> deployment.
 
 ---
 
@@ -136,6 +141,37 @@ flowchart TB
         BUD[AWS Budget] --> MAIL
     end
 ```
+
+---
+
+## Security & readiness
+
+Hardened and reviewed for **a small, known set of trusted users** (patients,
+health workers, and an admin you've personally onboarded) — **not** for the
+general public. In place: Cognito auth with role-based access (patient /
+power user / owner), least-privilege IAM throughout (documented exceptions
+where the AWS API itself has no resource-level scoping), encryption at rest
+and TLS-only bucket policies, DynamoDB point-in-time recovery, a read API
+locked to AWS_IAM auth, DLQ + CloudWatch alarms, and a static-analysis pass
+(Checkov/TFLint) triaged rather than rubber-stamped.
+
+Deliberately **not** production/public-ready:
+
+- **No BAA, HIPAA/equivalent compliance program, Terms of Service, Privacy
+  Policy, or documented user consent flow.** If this handles real health
+  photos of real people, that's a legal/compliance decision for you (and
+  likely counsel), not something this codebase can certify on its own.
+- **Rekognition label detection is a screening aid, not a diagnosis** or a
+  regulated medical device. Treat every automated route as advisory.
+- **Cognito is admin-create-only (no public sign-up), SES is in sandbox
+  mode** (can only email verified addresses), and this AWS account's Lambda
+  concurrency is capped at 10 — none of that supports open public traffic
+  without further work.
+- No WAF, no CAPTCHA/bot protection, no self-service signup, no third-party
+  security audit or penetration test.
+
+Bottom line: safe for the pilot scope it was built for; a genuine go/no-go
+decision (legal, clinical, and technical) before handing it to strangers.
 
 ---
 
@@ -340,13 +376,20 @@ state it was in, how long each took, and the Retry/Catch path taken on failure.
 
 ## Querying results after the fact
 
-**Read API** (no auth, throttled 5 req/s — non-sensitive metadata only):
+**Read API** (AWS_IAM/SigV4 auth required, throttled 5 req/s — the results
+include patient-identifying data, so this is no longer an open endpoint; a
+plain `curl` gets a 403). Use `awscurl` (`pip install awscurl`) with your own
+AWS credentials:
 
 ```bash
 BASE=$(terraform -chdir=terraform output -raw api_base_url)
-curl "$BASE/images?status=processed&limit=10"
-curl "$BASE/images/<image_id>"
+awscurl --service execute-api --region us-east-1 "$BASE/images?status=processed&limit=10"
+awscurl --service execute-api --region us-east-1 "$BASE/images/<image_id>"
 ```
+
+The calling principal needs `execute-api:Invoke` on this API's ARN - not
+granted to anyone by default; add it explicitly to whichever IAM principal
+should be able to call it.
 
 **Athena SQL** over every result JSON, no crawler (fixed schema):
 
