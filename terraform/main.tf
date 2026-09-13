@@ -300,10 +300,11 @@ resource "aws_lambda_function" "processor" {
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
 
-  # Caps concurrent invocations - at ~10 users this is far more than ever
-  # needed, but it hard-bounds worst-case Rekognition spend and blast radius
-  # from any runaway/abusive upload burst.
-  reserved_concurrent_executions = var.lambda_reserved_concurrency
+  # NOT setting reserved_concurrent_executions: this account's total Lambda
+  # concurrency limit is only 10 (AWS default minimum), and AWS requires >=10
+  # to stay unreserved account-wide at all times - reserving any amount here
+  # is mathematically impossible until a concurrency limit increase is
+  # requested from AWS support. Revisit var.lambda_reserved_concurrency then.
 
   tracing_config {
     mode = "Active"
